@@ -2,21 +2,15 @@ import io
 import re
 import zipfile
 from typing import List, Dict, Any, Optional
+from collections import defaultdict
 
 import pdfplumber
 import pandas as pd
 import streamlit as st
 
 
-# =========================================================
-# SYSTEMS
-# =========================================================
-SYSTEM_TYPES = ["Cadre", "Voelkr"]  # Cadre stays blank for now
+SYSTEM_TYPES = ["Cadre", "Voelkr"]
 
-
-# =========================================================
-# OUTPUT HEADERS (EXACTLY as you provided)
-# =========================================================
 VOELKR_COLUMNS = [
     "ReferralManager",
     "ReferralEmail",
@@ -55,21 +49,9 @@ VOELKR_COLUMNS = [
 VOELKR_DEFAULT_BRAND = "Voelker Controls"
 
 
-# =========================================================
-# PDF TEXT EXTRACTION
-# =========================================================
-def extract_full_text(pdf_bytes: bytes) -> str:
-    parts = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            try:
-                t = page.extract_text(layout=True) or ""
-            except TypeError:
-                t = page.extract_text() or ""
-            parts.append(t)
-    return "\n".join(parts)
-
-
+# -------------------------
+# BASIC NORMALIZERS
+# -------------------------
 def normalize_date(s: str) -> str:
     s = (s or "").strip()
     m = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", s)
@@ -87,150 +69,240 @@ def normalize_money(s: str) -> str:
     return m.group(0) if m else s
 
 
-# =========================================================
-# VOELKR: BETTER QUOTEDATE + ADDRESS BLOCK EXTRACTION
-# =========================================================
-def extract_quote_date(full_text: str, quote_number: str) -> str:
-    """
-    QuoteDate was missing for you.
-    We do:
-      1) If 'Date' label exists, prefer Date: mm/dd/yyyy
-      2) If QuoteNumber exists, look within 500 chars AFTER it for first date
-      3) Otherwise, take the first date in the document
-    """
-    # 1) labeled date (highest precision)
-    m = re.search(r"\bDate\b\s*[:#]?\s*(\d{1,2}/\d{1,2}/\d{4})", full_text, flags=re.IGNORECASE)
-    if m:
-        return normalize_date(m.group(1))
+# -------------------------
+# WORD-BASED LINE BUILDER
+# -------------------------
+def extract_words_all_pages(pdf_bytes: bytes) -> List[dict]:
+    words_all: List[dict] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            # "extract_words" is usually more reliable than extract_text for structured headers
+            words = page.extract_words(
+                x_tolerance=2,
+                y_tolerance=2,
+                keep_blank_chars=False,
+                use_text_flow=True,
+            ) or []
+            for w in words:
+                w["page_num"] = page.page_number
+            words_all.extend(words)
+    return words_all
 
-    # 2) near quote number
-    if quote_number:
-        qn = re.escape(quote_number)
-        m = re.search(qn + r"(.{0,500}?)(\d{1,2}/\d{1,2}/\d{4})", full_text, flags=re.DOTALL)
+
+def group_words_into_lines(words: List[dict], y_tol: float = 3.0, only_first_page: bool = True) -> List[str]:
+    """
+    Groups words into visual lines by y coordinate.
+    """
+    buckets = defaultdict(list)
+    for w in words:
+        if only_first_page and w.get("page_num") != 1:
+            continue
+        key = round(w["top"] / y_tol) * y_tol
+        buckets[key].append(w)
+
+    lines = []
+    for y in sorted(buckets.keys()):
+        row = sorted(buckets[y], key=lambda x: x["x0"])
+        line = " ".join(w["text"] for w in row).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def extract_full_text(pdf_bytes: bytes) -> str:
+    parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            try:
+                t = page.extract_text(layout=True) or ""
+            except TypeError:
+                t = page.extract_text() or ""
+            parts.append(t)
+    return "\n".join(parts)
+
+
+# -------------------------
+# VOELKR EXTRACTION (ROBUST)
+# -------------------------
+DATE_RE = re.compile(r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b")
+QUOTE_NO_RE = re.compile(r"\b(\d{2}/\d{6})\b")
+ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
+STATE_RE = re.compile(r"\b([A-Z]{2})\b")
+USA_RE = re.compile(r"\b(USA|United States of America)\b", re.IGNORECASE)
+
+MONEY_RE = re.compile(r"\b[\d,]+\.\d{2}\b")
+
+
+def find_first_match(lines: List[str], pattern: re.Pattern, prefer_label: Optional[str] = None) -> str:
+    """
+    Find match in lines.
+    If prefer_label is provided, first look in lines that contain that label.
+    """
+    if prefer_label:
+        for ln in lines:
+            if prefer_label.lower() in ln.lower():
+                m = pattern.search(ln)
+                if m:
+                    return m.group(1)
+    for ln in lines:
+        m = pattern.search(ln)
         if m:
-            return normalize_date(m.group(2))
-
-    # 3) first date anywhere
-    m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", full_text)
-    if m:
-        return normalize_date(m.group(1))
-
+            return m.group(1)
     return ""
 
 
-def extract_company_address_city_state_zip_country(full_text: str) -> Dict[str, str]:
+def extract_address_block_from_lines(lines: List[str]) -> Dict[str, str]:
     """
-    Address block was missing. We'll extract:
-      - Company (line above street when possible)
-      - Street address
-      - City, State, Zip
-      - Country (USA)
-
-    Strategy:
-      A) Strong: find a US address block with (street + city/state/zip)
-         Works with normal line breaks.
-      B) Fallback: same, but allow everything on ONE line (some PDFs flatten lines).
+    Extract Company, Address, City, State, Zip, Country from "visual lines".
+    Works when PDF text is broken in extract_text().
     """
     out: Dict[str, str] = {}
 
-    # A) Multi-line address block
-    m = re.search(
-        r"(?P<company>[A-Z0-9][A-Z0-9 &',.\-]{3,})\s*\n+"
-        r"(?P<street>\d{3,6}\s+[A-Z0-9][A-Z0-9 .#&'\-]+)\s*\n+"
-        r"(?P<city>[A-Z][A-Z .'\-]+?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\s*\n+"
-        r"(?P<country>USA|United States of America)\b",
-        full_text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["Company"] = m.group("company").strip()
-        out["Address"] = m.group("street").strip()
-        out["City"] = m.group("city").strip()
-        out["State"] = m.group("state").strip().upper()
-        out["ZipCode"] = m.group("zip").strip()
-        out["Country"] = "USA"
-        return out
+    # We locate a line containing a ZIP. Usually address appears as:
+    #   COMPANY
+    #   4265 GIBSON DRIVE
+    #   TIPP CITY OH 45371
+    #   USA
+    #
+    # We'll scan for a "city state zip" line, then take street line above it,
+    # company line above street, and optional country line below.
+    for i, ln in enumerate(lines):
+        if not ZIP_RE.search(ln):
+            continue
 
-    # B) Fallback when PDF text is flattened onto one line
-    # Example: "SINBON USA LLC 4265 GIBSON DRIVE TIPP CITY OH 45371 USA"
-    m = re.search(
-        r"(?P<company>[A-Z0-9][A-Z0-9 &',.\-]{3,})\s+"
-        r"(?P<street>\d{3,6}\s+[A-Z0-9][A-Z0-9 .#&'\-]+)\s+"
-        r"(?P<city>[A-Z][A-Z .'\-]+?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\s+"
-        r"(?P<country>USA|United States of America)\b",
-        full_text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["Company"] = m.group("company").strip()
-        out["Address"] = m.group("street").strip()
-        out["City"] = m.group("city").strip()
-        out["State"] = m.group("state").strip().upper()
-        out["ZipCode"] = m.group("zip").strip()
-        out["Country"] = "USA"
-        return out
+        # Try parse city/state/zip from this line
+        # e.g., "TIPP CITY OH 45371"
+        m_zip = ZIP_RE.search(ln)
+        zip_code = m_zip.group(1) if m_zip else ""
+        # state = last 2-letter token before zip (best effort)
+        tokens = ln.split()
+        state = ""
+        if zip_code and zip_code in tokens:
+            zidx = tokens.index(zip_code)
+            if zidx >= 1:
+                cand = tokens[zidx - 1]
+                if re.fullmatch(r"[A-Z]{2}", cand):
+                    state = cand
 
-    # C) If company is not in the same block, still try to get street + city/state/zip
-    m = re.search(
-        r"(?P<street>\d{3,6}\s+[A-Z0-9][A-Z0-9 .#&'\-]+)\s*\n+"
-        r"(?P<city>[A-Z][A-Z .'\-]+?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\b",
-        full_text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["Address"] = m.group("street").strip()
-        out["City"] = m.group("city").strip()
-        out["State"] = m.group("state").strip().upper()
-        out["ZipCode"] = m.group("zip").strip()
-        # Country: if USA appears anywhere, set it
-        if re.search(r"\b(USA|United States of America)\b", full_text, flags=re.IGNORECASE):
+        # city = tokens before state (join)
+        city = ""
+        if state and state in tokens:
+            sidx = tokens.index(state)
+            if sidx >= 1:
+                city = " ".join(tokens[:sidx]).strip()
+
+        if zip_code:
+            out["ZipCode"] = zip_code
+        if state:
+            out["State"] = state
+        if city:
+            out["City"] = city
+
+        # street = previous non-empty line
+        street = ""
+        j = i - 1
+        while j >= 0:
+            if lines[j].strip():
+                street = lines[j].strip()
+                break
+            j -= 1
+        if street:
+            out["Address"] = street
+
+        # company = line above street
+        company = ""
+        if j - 1 >= 0:
+            company = lines[j - 1].strip()
+        # company sanity: avoid labels
+        if company and not re.search(r"(date|quote|customer|phone|fax|ship|bill|sold\s*to)", company, re.IGNORECASE):
+            out["Company"] = company
+
+        # country = next line if it contains USA
+        country = ""
+        if i + 1 < len(lines) and USA_RE.search(lines[i + 1]):
+            country = "USA"
+        elif USA_RE.search(ln):
+            country = "USA"
+        else:
+            # sometimes USA appears elsewhere in header
+            for k in range(i, min(i + 4, len(lines))):
+                if USA_RE.search(lines[k]):
+                    country = "USA"
+                    break
+
+        if country:
             out["Country"] = "USA"
 
-        # best-effort company: nearest non-empty line above street
-        street_line = m.group("street").strip()
-        pos = full_text.lower().find(street_line.lower())
-        if pos != -1:
-            before = full_text[max(0, pos - 250):pos]
-            lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
-            for cand in reversed(lines[-8:]):
-                if len(cand) >= 4 and not re.search(r"(phone|fax|date|quote|customer|ship|bill|sold\s*to)", cand, re.IGNORECASE):
-                    if not re.match(r"^\d{3,6}\s", cand):
-                        out["Company"] = cand
-                        break
+        # If we got zip + address, we consider it found and stop.
+        if out.get("ZipCode") and out.get("Address"):
+            break
 
     return out
 
 
-def extract_voelkr_fields(full_text: str) -> Dict[str, str]:
+def extract_voelkr_fields(pdf_bytes: bytes) -> Dict[str, str]:
+    """
+    Primary extraction uses word-built lines (page 1),
+    fallback to full text if needed.
+    """
     out: Dict[str, str] = {}
 
-    # QuoteNumber: example "01/125785"
-    m = re.search(r"\b(\d{2}/\d{6})\b", full_text)
-    if m:
-        out["QuoteNumber"] = m.group(1).strip()
+    words = extract_words_all_pages(pdf_bytes)
+    lines = group_words_into_lines(words, y_tol=3.0, only_first_page=True)
 
-    # QuoteDate: improved
-    out["QuoteDate"] = extract_quote_date(full_text, out.get("QuoteNumber", ""))
+    # Fallback raw text
+    full_text = extract_full_text(pdf_bytes)
 
-    # CustomerNumber: example 10980
+    # QuoteNumber
+    qn = find_first_match(lines, QUOTE_NO_RE) or (QUOTE_NO_RE.search(full_text).group(1) if QUOTE_NO_RE.search(full_text) else "")
+    out["QuoteNumber"] = qn
+
+    # QuoteDate (prefer lines containing "Date")
+    qd = find_first_match(lines, DATE_RE, prefer_label="Date")
+    if not qd and qn:
+        # look in nearby lines after quote number
+        for i, ln in enumerate(lines):
+            if qn in ln:
+                for j in range(i, min(i + 8, len(lines))):
+                    m = DATE_RE.search(lines[j])
+                    if m:
+                        qd = m.group(1)
+                        break
+            if qd:
+                break
+    if not qd:
+        # fallback: first date in full text
+        m = DATE_RE.search(full_text)
+        qd = m.group(1) if m else ""
+    out["QuoteDate"] = normalize_date(qd) if qd else ""
+
+    # ReferralManager (your sample: DAYTON)
+    if any(re.search(r"\bDAYTON\b", ln) for ln in lines) or re.search(r"\bDAYTON\b", full_text):
+        out["ReferralManager"] = "DAYTON"
+
+    # CustomerNumber
     m = re.search(r"Customer\s*(?:No\.?|Number)?\s*[:#]?\s*(\d{3,10})", full_text, flags=re.IGNORECASE)
     if m:
         out["CustomerNumber"] = m.group(1).strip()
 
-    # ReferralManager: DAYTON
-    m = re.search(r"\bDAYTON\b", full_text)
-    if m:
-        out["ReferralManager"] = "DAYTON"
-
-    # TotalSales
-    m = re.search(r"(?:Total\s*Sales|Grand\s*Total|Total)\s*[: ]+\$?\s*([\d,]+\.\d{2})",
-                  full_text, flags=re.IGNORECASE)
-    if m:
-        out["TotalSales"] = normalize_money(m.group(1))
-    else:
-        monies = re.findall(r"\b[\d,]+\.\d{2}\b", full_text)
-        if monies:
-            out["TotalSales"] = normalize_money(monies[-1])
+    # TotalSales (prefer label lines)
+    total = ""
+    for ln in lines:
+        if re.search(r"\b(total|grand total|total sales)\b", ln, re.IGNORECASE):
+            mm = MONEY_RE.search(ln)
+            if mm:
+                total = mm.group(0)
+                break
+    if not total:
+        m = re.search(r"(?:Total\s*Sales|Grand\s*Total|Total)\s*[: ]+\$?\s*([\d,]+\.\d{2})",
+                      full_text, flags=re.IGNORECASE)
+        if m:
+            total = m.group(1)
+        else:
+            monies = MONEY_RE.findall(full_text)
+            if monies:
+                total = monies[-1]
+    out["TotalSales"] = normalize_money(total) if total else ""
 
     # Created_By
     m = re.search(r"(?:Created\s*By|Prepared\s*By|Entered\s*By)\s*[:#]?\s*([A-Za-z][A-Za-z .'\-]+)",
@@ -242,33 +314,21 @@ def extract_voelkr_fields(full_text: str) -> Dict[str, str]:
         if m:
             out["Created_By"] = "Loghan Keefer"
 
-    # Address block: improved (Company, Address, City, State, Zip, Country)
-    out.update(extract_company_address_city_state_zip_country(full_text))
+    # Address block (Company/Address/City/State/Zip/Country) from lines
+    out.update(extract_address_block_from_lines(lines))
 
-    # Brand default always
+    # Brand default
     out["Brand"] = VOELKR_DEFAULT_BRAND
 
     return out
 
 
 def build_voelkr_row(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
-    full_text = extract_full_text(pdf_bytes)
-    extracted = extract_voelkr_fields(full_text)
-
+    extracted = extract_voelkr_fields(pdf_bytes)
     row = {c: "" for c in VOELKR_COLUMNS}
     row.update(extracted)
     row["PDF"] = filename
     row["Brand"] = VOELKR_DEFAULT_BRAND
-
-    # normalize
-    if row.get("QuoteDate"):
-        row["QuoteDate"] = normalize_date(row["QuoteDate"])
-    if row.get("TotalSales"):
-        row["TotalSales"] = normalize_money(row["TotalSales"])
-    if row.get("Country"):
-        if row["Country"].strip().lower().startswith("united") or row["Country"].strip().upper() == "USA":
-            row["Country"] = "USA"
-
     return row
 
 
@@ -282,7 +342,7 @@ st.markdown(
     """
 Select **Voelkr** to extract header fields.
 
-- **Cadre** is intentionally blank for now (mapping will be added later).
+- **Cadre** is intentionally blank for now.
 - Upload PDFs → Extract → Download one ZIP (CSV + PDFs)
 - Files are processed **in-memory** (not saved to disk by the app).
 """
@@ -365,7 +425,6 @@ if extract_btn:
 
             df = pd.DataFrame(rows, columns=VOELKR_COLUMNS)
 
-            # build ZIP: CSV + PDFs
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("extracted/voelkr_extracted.csv", df.to_csv(index=False).encode("utf-8"))
@@ -377,6 +436,5 @@ if extract_btn:
             st.session_state["result_df"] = df
             st.session_state["result_summary"] = f"Parsed {len(file_data)} PDF(s). Output rows: {len(df)}."
 
-            # clear uploader
             st.session_state["uploader_key"] += 1
             st.rerun()
