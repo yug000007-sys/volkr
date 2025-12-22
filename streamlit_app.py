@@ -2,7 +2,7 @@ import io
 import re
 import zipfile
 from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from collections import defaultdict
 
 import pdfplumber
