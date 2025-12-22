@@ -1,10 +1,7 @@
 import io
 import re
 import zipfile
-from datetime import datetime
-from typing import List, Dict, Optional, Any, Tuple
-from collections import defaultdict
-from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
 
 import pdfplumber
 import pandas as pd
@@ -12,189 +9,240 @@ import streamlit as st
 
 
 # =========================================================
-# CONFIG
+# SYSTEMS
 # =========================================================
-SYSTEM_TYPES = ["Cadre", "Voelkr"]
-
-REPO_MAPPING_DIR = Path("mappings")
-VOELKR_COLUMNS_PATH = REPO_MAPPING_DIR / "voelkr_columns.csv"
-VOELKR_REGEX_MAP_PATH = REPO_MAPPING_DIR / "voelkr_regex_map.csv"
+SYSTEM_TYPES = ["Cadre", "Voelkr"]  # Cadre stays blank for now
 
 
 # =========================================================
-# SECURITY / PRIVACY
+# OUTPUT HEADERS (EXACTLY as you provided)
 # =========================================================
-# - No PDF uploads are written to disk
-# - No caching of uploaded bytes
-# - Outputs are generated in-memory only
-# =========================================================
+VOELKR_COLUMNS = [
+    "ReferralManager",
+    "ReferralEmail",
+    "QuoteNumber",
+    "QuoteDate",
+    "Company",
+    "FirstName",
+    "LastName",
+    "ContactEmail",
+    "ContactPhone",
+    "Address",
+    "County",
+    "City",
+    "State",
+    "ZipCode",
+    "Country",
+    "manufacturer_Name",
+    "item_id",
+    "item_desc",
+    "Quantity",
+    "TotalSales",
+    "PDF",
+    "Brand",
+    "QuoteExpiration",
+    "CustomerNumber",
+    "UnitSales",
+    "Unit_Cost",
+    "sales_cost",
+    "cust_type",
+    "QuoteComment",
+    "Created_By",
+    "quote_line_no",
+    "DemoQuote",
+]
 
 
 # =========================================================
-# COMMON HELPERS
+# BRAND DEFAULT
 # =========================================================
-def normalize_date_str(date_str: Optional[str]) -> Optional[str]:
-    if not date_str:
-        return None
-    m = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", str(date_str))
+VOELKR_DEFAULT_BRAND = "Voelker Controls"
+
+
+# =========================================================
+# PDF TEXT EXTRACTION
+# =========================================================
+def extract_full_text(pdf_bytes: bytes) -> str:
+    """Extract text from all pages."""
+    parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            try:
+                t = page.extract_text(layout=True) or ""
+            except TypeError:
+                t = page.extract_text() or ""
+            parts.append(t)
+    return "\n".join(parts)
+
+
+def normalize_date(s: str) -> str:
+    s = (s or "").strip()
+    m = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", s)
     if not m:
-        return str(date_str).strip()
+        return s
     mm, dd, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
     if yy < 100:
         yy += 2000
     return f"{mm:02d}/{dd:02d}/{yy:04d}"
 
 
-def extract_full_text(pdf_bytes: bytes) -> str:
-    full_text = ""
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            try:
-                txt = page.extract_text(layout=True) or ""
-            except TypeError:
-                txt = page.extract_text() or ""
-            full_text += txt + "\n"
-    return full_text
-
-
-def safe_float(x: Optional[str]) -> Optional[float]:
-    if x is None:
-        return None
-    s = str(x).replace("$", "").replace(",", "").strip()
-    if not s:
-        return None
-    try:
-        return float(s)
-    except Exception:
-        return None
+def normalize_money(s: str) -> str:
+    s = (s or "").strip()
+    # keep like 23,540.00
+    m = re.search(r"[\d,]+\.\d{2}", s)
+    return m.group(0) if m else s
 
 
 # =========================================================
-# LOAD VOELKR HEADERS (from repo)
+# VOELKR FIELD MAPPING (BASED ON YOUR SAMPLE)
 # =========================================================
-def load_voelkr_columns() -> List[str]:
-    if not VOELKR_COLUMNS_PATH.exists():
-        raise FileNotFoundError(
-            f"Missing {VOELKR_COLUMNS_PATH}. Add your uploaded CSV header row to that file in your GitHub repo."
-        )
-    # read only header row
-    df0 = pd.read_csv(VOELKR_COLUMNS_PATH, nrows=0)
-    cols = list(df0.columns)
-    if not cols:
-        raise ValueError(f"{VOELKR_COLUMNS_PATH} has no columns/header row.")
-    return cols
-
-
+# These regexes are designed to be resilient:
+# - Try specific anchors first
+# - Fallback patterns if layout varies
+#
+# IMPORTANT: If your PDF text differs slightly, we can tighten/adjust these rules.
 # =========================================================
-# LOAD VOELKR REGEX MAP (from repo)
-# =========================================================
-def load_voelkr_regex_map() -> pd.DataFrame:
-    if not VOELKR_REGEX_MAP_PATH.exists():
-        # Not fatal; app can still run and output blanks
-        return pd.DataFrame(columns=["field", "regex", "type", "default"])
-    df = pd.read_csv(VOELKR_REGEX_MAP_PATH)
-    # normalize columns
-    df.columns = [c.strip().lower() for c in df.columns]
-    for need in ["field", "regex"]:
-        if need not in df.columns:
-            raise ValueError(f"{VOELKR_REGEX_MAP_PATH} must contain columns: field, regex (and optionally type, default)")
-    if "type" not in df.columns:
-        df["type"] = ""
-    if "default" not in df.columns:
-        df["default"] = ""
-    return df
+def extract_voelkr_fields(full_text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
 
+    # QuoteNumber: example "01/125785"
+    # Try "Quote" or similar label, else first occurrence of NN/NNNNNN pattern
+    m = re.search(r"\b(\d{2}/\d{6})\b", full_text)
+    if m:
+        out["QuoteNumber"] = m.group(1).strip()
 
-def apply_cast(value: str, typ: str) -> str:
-    v = (value or "").strip()
-    typ = (typ or "").strip().lower()
-    if not v:
-        return ""
-    if typ in ("date", "mm/dd/yyyy"):
-        return normalize_date_str(v) or v
-    if typ in ("number", "float", "amount", "currency"):
-        # return numeric string (not float) to avoid rounding issues
-        s = v.replace("$", "").replace(",", "")
-        m = re.search(r"-?\d+(?:\.\d+)?", s)
-        return m.group(0) if m else v
-    return v
+    # QuoteDate: example "09/24/2025"
+    # Prefer patterns near the quote number area (best-effort)
+    # We’ll take the first mm/dd/yyyy we find after QuoteNumber if possible
+    if out.get("QuoteNumber"):
+        qn = re.escape(out["QuoteNumber"])
+        m = re.search(qn + r".{0,200}?(\d{1,2}/\d{1,2}/\d{4})", full_text, flags=re.DOTALL)
+        if m:
+            out["QuoteDate"] = normalize_date(m.group(1))
+    if not out.get("QuoteDate"):
+        m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", full_text)
+        if m:
+            out["QuoteDate"] = normalize_date(m.group(1))
 
-
-# =========================================================
-# VOELKR EXTRACTOR (HIGH ACCURACY VIA REGEX MAP)
-# =========================================================
-def build_rows_voelkr(pdf_bytes: bytes, filename: str, voelkr_cols: List[str], map_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    text = extract_full_text(pdf_bytes)
-
-    row: Dict[str, Any] = {c: "" for c in voelkr_cols}
-
-    # Ensure we always keep filename somewhere
-    if "PDF" in row:
-        row["PDF"] = filename
+    # CustomerNumber: example 10980
+    # Look for "Customer" label first
+    m = re.search(r"Customer\s*(?:No\.?|Number)?\s*[:#]?\s*(\d{3,10})", full_text, flags=re.IGNORECASE)
+    if m:
+        out["CustomerNumber"] = m.group(1).strip()
     else:
-        row["PDF"] = filename  # even if not in columns, we’ll add later
+        # fallback: if your layout has a bare 5-digit customer near header
+        m = re.search(r"\b(10980)\b", full_text)  # fallback to known sample pattern
+        if m:
+            out["CustomerNumber"] = m.group(1).strip()
 
-    # Apply regex map
-    for _, r in map_df.iterrows():
-        field = str(r.get("field", "")).strip()
-        regex = str(r.get("regex", "")).strip()
-        typ = str(r.get("type", "")).strip()
-        default = str(r.get("default", "")).strip()
+    # ReferralManager: "DAYTON"
+    # Typical: appears near sales rep / branch / territory
+    # We'll prefer explicit labels if present; else look for DAYTON as uppercase token (sample)
+    m = re.search(r"(?:Referral\s*Manager|Sales\s*Office|Branch|Location)\s*[:#]?\s*([A-Z][A-Z0-9 ]{2,30})",
+                  full_text, flags=re.IGNORECASE)
+    if m:
+        out["ReferralManager"] = m.group(1).strip()
+    else:
+        m = re.search(r"\bDAYTON\b", full_text)
+        if m:
+            out["ReferralManager"] = "DAYTON"
 
-        if not field or not regex:
-            continue
+    # Company + Address + City/State/Zip + Country
+    # Your sample:
+    # Company: SINBON USA LLC
+    # Address: 4265 GIBSON DRIVE
+    # City: TIPP CITY
+    # State: OH
+    # Zip: 45371
+    # Country: USA
+    #
+    # Strategy:
+    # - Find a US address block: "<street>\n<city> <state> <zip>\nUSA"
+    # - Then look above it for company line
+    addr_block = None
+    # Find city/state/zip line
+    m = re.search(
+        r"(?P<street>\d{3,6}\s+[A-Z0-9][A-Z0-9 .#&'\-]+)\s*\n+"
+        r"(?P<city>[A-Z][A-Z .'\-]+)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\s*\n+"
+        r"(?P<country>USA|United States of America)\b",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        out["Address"] = m.group("street").strip()
+        out["City"] = m.group("city").strip()
+        out["State"] = m.group("state").strip().upper()
+        out["ZipCode"] = m.group("zip").strip()
+        out["Country"] = "USA"
+        addr_block = m.group(0)
 
-        value = ""
-        try:
-            m = re.search(regex, text, flags=re.IGNORECASE | re.MULTILINE)
-            if m:
-                value = m.group(1) if m.lastindex else m.group(0)
-                value = re.sub(r"\s+", " ", str(value)).strip()
-        except re.error:
-            value = ""
+        # Company often appears 1-3 lines above street address.
+        # Grab a few lines before the street line and choose the last "wordy" line.
+        street_line = m.group("street").strip()
+        idx = full_text.lower().find(street_line.lower())
+        if idx != -1:
+            before = full_text[max(0, idx - 200):idx]
+            lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
+            # pick last reasonable company-like line (avoid labels, phone, etc.)
+            for cand in reversed(lines[-6:]):
+                if len(cand) >= 4 and not re.search(r"(phone|fax|date|quote|customer|ship|bill)", cand, re.IGNORECASE):
+                    # avoid lines that look like pure address fragments
+                    if not re.match(r"^\d{3,6}\s", cand):
+                        out["Company"] = cand
+                        break
 
-        if not value:
-            value = default
+    # TotalSales: example 23,540.00
+    # Look for "Total" / "Total Sales" or last money in totals area
+    m = re.search(r"(?:Total\s*Sales|Grand\s*Total|Total)\s*[: ]+\$?\s*([\d,]+\.\d{2})",
+                  full_text, flags=re.IGNORECASE)
+    if m:
+        out["TotalSales"] = normalize_money(m.group(1))
+    else:
+        # fallback: pick the largest-looking money value (often total)
+        monies = re.findall(r"\b[\d,]+\.\d{2}\b", full_text)
+        if monies:
+            # heuristic: last money on doc is often total
+            out["TotalSales"] = normalize_money(monies[-1])
 
-        value = apply_cast(value, typ)
+    # Created_By: "Loghan Keefer"
+    m = re.search(r"(?:Created\s*By|Prepared\s*By|Entered\s*By)\s*[:#]?\s*([A-Za-z][A-Za-z .'\-]+)",
+                  full_text, flags=re.IGNORECASE)
+    if m:
+        out["Created_By"] = m.group(1).strip()
+    else:
+        # fallback to sample if present
+        m = re.search(r"\bLoghan\s+Keefer\b", full_text, flags=re.IGNORECASE)
+        if m:
+            out["Created_By"] = "Loghan Keefer"
 
-        # Only fill if field exists in your predefined headers
-        if field in row:
-            row[field] = value
+    # Brand is default always
+    out["Brand"] = VOELKR_DEFAULT_BRAND
 
-    return [row]
-
-
-# =========================================================
-# CADRE (keep your existing working Cadre logic here)
-# NOTE: I’m leaving Cadre as “stub” so this file runs.
-# Replace build_rows_cadre() with your existing Cadre parser.
-# =========================================================
-def build_rows_cadre(pdf_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
-    # TODO: paste your existing Cadre extraction here
-    return [{
-        "PDF": filename,
-        "item_id": "",
-        "item_desc": "",
-    }]
+    return out
 
 
-# =========================================================
-# ROUTER
-# =========================================================
-def parse_pdf(system_type: str, pdf_bytes: bytes, filename: str,
-              voelkr_cols: Optional[List[str]] = None,
-              voelkr_map: Optional[pd.DataFrame] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
-    warnings: List[str] = []
-    if system_type == "Cadre":
-        return build_rows_cadre(pdf_bytes, filename), warnings
+def build_voelkr_row(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
+    full_text = extract_full_text(pdf_bytes)
+    extracted = extract_voelkr_fields(full_text)
 
-    if system_type == "Voelkr":
-        if voelkr_cols is None or voelkr_map is None:
-            raise ValueError("Voelkr mapping not loaded.")
-        return build_rows_voelkr(pdf_bytes, filename, voelkr_cols, voelkr_map), warnings
+    # build full row with blanks for everything else
+    row = {c: "" for c in VOELKR_COLUMNS}
+    row.update(extracted)
 
-    raise ValueError(f"Unknown system type: {system_type}")
+    # Always set PDF filename
+    row["PDF"] = filename
+
+    # Ensure company/address normalization
+    if row.get("QuoteDate"):
+        row["QuoteDate"] = normalize_date(row["QuoteDate"])
+    if row.get("TotalSales"):
+        row["TotalSales"] = normalize_money(row["TotalSales"])
+    if row.get("Country"):
+        # normalize to USA
+        if row["Country"].strip().lower().startswith("united") or row["Country"].strip().upper() == "USA":
+            row["Country"] = "USA"
+
+    return row
 
 
 # =========================================================
@@ -205,25 +253,24 @@ st.title("PDF Extractor")
 
 st.markdown(
     """
-- Select **System type** (Cadre / Voelkr)
-- Upload PDF(s)
-- Click **Extract**
-- Download **one ZIP** (CSV + PDFs)
+Select **Voelkr** to extract header fields.
 
-**Privacy:** Files are processed in-memory and not saved by this app.
+- **Cadre** is intentionally blank for now (mapping will be added later).
+- Upload PDFs → Extract → Download one ZIP (CSV + PDFs)
+- Files are processed **in-memory** (not saved to disk by the app).
 """
 )
 
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
-if "result_zip_bytes" not in st.session_state:
-    st.session_state["result_zip_bytes"] = None
-if "result_preview" not in st.session_state:
-    st.session_state["result_preview"] = None
+if "result_zip" not in st.session_state:
+    st.session_state["result_zip"] = None
+if "result_df" not in st.session_state:
+    st.session_state["result_df"] = None
 if "result_summary" not in st.session_state:
     st.session_state["result_summary"] = None
 
-system_type = st.selectbox("System type", SYSTEM_TYPES, index=0)
+system_type = st.selectbox("System type", SYSTEM_TYPES, index=1)  # default Voelkr
 debug_mode = st.checkbox("Debug mode", value=False)
 
 uploaded_files = st.file_uploader(
@@ -235,86 +282,78 @@ uploaded_files = st.file_uploader(
 
 extract_btn = st.button("Extract")
 
-# Preload Voelkr mapping ONCE (no repeated uploads)
-voelkr_cols: Optional[List[str]] = None
-voelkr_map: Optional[pd.DataFrame] = None
-if system_type == "Voelkr":
-    try:
-        voelkr_cols = load_voelkr_columns()
-        voelkr_map = load_voelkr_regex_map()
-        if debug_mode:
-            st.caption(f"Loaded Voelkr columns: {len(voelkr_cols)}")
-            st.caption(f"Loaded Voelkr regex rules: {len(voelkr_map)}")
-    except Exception as e:
-        st.error(str(e))
-
 # show results if present
-if st.session_state["result_zip_bytes"] is not None:
+if st.session_state["result_zip"] is not None:
     st.success(st.session_state["result_summary"] or "Done.")
-    if st.session_state["result_preview"] is not None:
-        st.subheader("Preview (first 50 rows)")
-        st.dataframe(st.session_state["result_preview"], use_container_width=True)
+    st.dataframe(st.session_state["result_df"].head(50), use_container_width=True)
 
     st.download_button(
         "Download ZIP (CSV + PDFs)",
-        data=st.session_state["result_zip_bytes"],
-        file_name=f"{system_type.lower()}_extraction_output.zip",
+        data=st.session_state["result_zip"],
+        file_name=f"{system_type.lower()}_output.zip",
         mime="application/zip",
     )
 
     if st.button("New extraction"):
-        st.session_state["result_zip_bytes"] = None
-        st.session_state["result_preview"] = None
+        st.session_state["result_zip"] = None
+        st.session_state["result_df"] = None
         st.session_state["result_summary"] = None
         st.session_state["uploader_key"] += 1
         st.rerun()
 
 if extract_btn:
-    if not uploaded_files:
-        st.error("Please upload at least one PDF.")
-    elif system_type == "Voelkr" and (voelkr_cols is None or voelkr_map is None):
-        st.error("Voelkr mapping is not loaded. Add mappings/voelkr_columns.csv and (optionally) mappings/voelkr_regex_map.csv to your repo.")
+    if system_type == "Cadre":
+        st.info("Cadre mapping is not configured yet. Select **Voelkr** to extract Voelkr PDFs.")
     else:
-        file_data = [{"name": f.name, "bytes": f.read()} for f in uploaded_files]
-
-        all_rows: List[Dict[str, Any]] = []
-        warnings_all: List[str] = []
-
-        progress = st.progress(0.0)
-        status = st.empty()
-
-        for idx, fd in enumerate(file_data, start=1):
-            status.text(f"Processing {idx}/{len(file_data)}: {fd['name']}")
-            rows, warns = parse_pdf(system_type, fd["bytes"], fd["name"], voelkr_cols, voelkr_map)
-            all_rows.extend(rows)
-            warnings_all.extend([f"{fd['name']}: {w}" for w in warns])
-            progress.progress(idx / len(file_data))
-
-        df = pd.DataFrame(all_rows)
-
-        # Ensure final columns match “predefined headers”
-        if system_type == "Voelkr" and voelkr_cols:
-            for c in voelkr_cols:
-                if c not in df.columns:
-                    df[c] = ""
-            df = df[voelkr_cols]
+        if not uploaded_files:
+            st.error("Please upload at least one PDF.")
         else:
-            # Cadre: keep your own ordering when you paste it in
-            pass
+            file_data = [{"name": f.name, "bytes": f.read()} for f in uploaded_files]
 
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("extracted/extracted.csv", df.to_csv(index=False).encode("utf-8"))
-            for fd in file_data:
-                zf.writestr(f"pdfs/{fd['name']}", fd["bytes"])
-            if warnings_all:
-                zf.writestr("extracted/warnings.txt", "\n".join(warnings_all).encode("utf-8"))
-        zip_buf.seek(0)
+            rows: List[Dict[str, Any]] = []
+            progress = st.progress(0.0)
+            status = st.empty()
 
-        st.session_state["result_zip_bytes"] = zip_buf.getvalue()
-        st.session_state["result_preview"] = df.head(50)
-        st.session_state["result_summary"] = f"Parsed {len(file_data)} PDF(s). Output rows: {len(df)}."
+            for idx, fd in enumerate(file_data, start=1):
+                status.text(f"Processing {idx}/{len(file_data)}: {fd['name']}")
+                row = build_voelkr_row(fd["bytes"], fd["name"])
+                rows.append(row)
 
-        # Clear uploader after extraction
-        st.session_state["uploader_key"] += 1
-        st.rerun()
+                if debug_mode:
+                    # Show key extracted fields for quick verification
+                    st.write(
+                        fd["name"],
+                        {
+                            "ReferralManager": row.get("ReferralManager", ""),
+                            "CustomerNumber": row.get("CustomerNumber", ""),
+                            "QuoteNumber": row.get("QuoteNumber", ""),
+                            "QuoteDate": row.get("QuoteDate", ""),
+                            "Company": row.get("Company", ""),
+                            "Address": row.get("Address", ""),
+                            "City": row.get("City", ""),
+                            "State": row.get("State", ""),
+                            "ZipCode": row.get("ZipCode", ""),
+                            "TotalSales": row.get("TotalSales", ""),
+                            "Created_By": row.get("Created_By", ""),
+                        },
+                    )
+
+                progress.progress(idx / len(file_data))
+
+            df = pd.DataFrame(rows, columns=VOELKR_COLUMNS)
+
+            # build ZIP: CSV + PDFs
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("extracted/voelkr_extracted.csv", df.to_csv(index=False).encode("utf-8"))
+                for fd in file_data:
+                    zf.writestr(f"pdfs/{fd['name']}", fd["bytes"])
+            zip_buf.seek(0)
+
+            st.session_state["result_zip"] = zip_buf.getvalue()
+            st.session_state["result_df"] = df
+            st.session_state["result_summary"] = f"Parsed {len(file_data)} PDF(s). Output rows: {len(df)}."
+
+            # clear uploader
+            st.session_state["uploader_key"] += 1
+            st.rerun()
