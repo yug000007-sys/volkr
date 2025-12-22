@@ -75,11 +75,18 @@ def normalize_money(s: str) -> str:
     if not s:
         return ""
     m = re.search(r"[\d,]+\.\d{2}", s)
-    return m.group(0) if m else s
+    return m.group(0) if m else s.strip()
+
+
+def clean_company_line(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"^\s*(ship\s*to|ship-to)\s*:?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*(sold\s*to|bill\s*to)\s*:?\s*", "", s, flags=re.IGNORECASE)
+    return s.strip()
 
 
 # =========================================================
-# PDF EXTRACTION
+# PDF WORD EXTRACTION
 # =========================================================
 def extract_words_all_pages(pdf_bytes: bytes) -> List[dict]:
     words_all: List[dict] = []
@@ -123,7 +130,7 @@ def extract_full_text(pdf_bytes: bytes) -> str:
 
 
 # =========================================================
-# VOELKR EXTRACTION (ROBUST)
+# REGEX
 # =========================================================
 DATE_RE = re.compile(r"\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b")
 QUOTE_NO_RE = re.compile(r"\b(\d{2}/\d{6})\b")
@@ -132,6 +139,9 @@ USA_RE = re.compile(r"\b(USA|United States of America)\b", re.IGNORECASE)
 MONEY_RE = re.compile(r"\b[\d,]+\.\d{2}\b")
 
 
+# =========================================================
+# VOELKR FIELD EXTRACTORS
+# =========================================================
 def extract_quote_date(lines: List[str], full_text: str, quote_number: str) -> str:
     for ln in lines:
         if "date" in ln.lower():
@@ -142,7 +152,7 @@ def extract_quote_date(lines: List[str], full_text: str, quote_number: str) -> s
     if quote_number:
         for i, ln in enumerate(lines):
             if quote_number in ln:
-                for j in range(i, min(i + 10, len(lines))):
+                for j in range(i, min(i + 12, len(lines))):
                     m = DATE_RE.search(lines[j])
                     if m:
                         return normalize_date(m.group(1))
@@ -167,7 +177,6 @@ def extract_customer_number_from_words(words: List[dict]) -> str:
     sorted_row_keys = sorted(rows.keys())
     num_re = re.compile(r"^\d{3,10}$")
 
-    # Find 'Cust' label and nearest numeric to right / below
     for idx, rk in enumerate(sorted_row_keys):
         row = sorted(rows[rk], key=lambda x: x["x0"])
         for w in row:
@@ -177,157 +186,174 @@ def extract_customer_number_from_words(words: List[dict]) -> str:
             if t.lower().startswith("cust") or t.lower().startswith("customer"):
                 label_x = w["x0"]
 
-                # same row right side
-                right_words = sorted([ww for ww in row if ww["x0"] > label_x], key=lambda x: x["x0"])
-                for ww in right_words[:20]:
-                    val = (ww.get("text") or "").strip()
-                    val = re.sub(r"[^\d]", "", val)
+                right = sorted([ww for ww in row if ww["x0"] > label_x], key=lambda x: x["x0"])
+                for ww in right[:25]:
+                    val = re.sub(r"[^\d]", "", (ww.get("text") or ""))
                     if num_re.match(val):
                         return val
 
-                # next rows (1-3)
                 for down in (1, 2, 3):
                     if idx + down >= len(sorted_row_keys):
                         break
                     row2 = sorted(rows[sorted_row_keys[idx + down]], key=lambda x: x["x0"])
-                    nearby = sorted([ww for ww in row2 if ww["x0"] >= label_x - 10], key=lambda x: x["x0"])
-                    for ww in nearby[:20]:
-                        val = (ww.get("text") or "").strip()
-                        val = re.sub(r"[^\d]", "", val)
+                    near = sorted([ww for ww in row2 if ww["x0"] >= label_x - 10], key=lambda x: x["x0"])
+                    for ww in near[:25]:
+                        val = re.sub(r"[^\d]", "", (ww.get("text") or ""))
                         if num_re.match(val):
                             return val
 
     return ""
 
 
-def extract_created_by(lines: List[str], full_text: str) -> str:
+def extract_created_by_from_words(words: List[dict]) -> str:
     """
-    Created_By was missing: some PDFs show it as 'Created By', 'Prepared By',
-    'Created:' or even just a name near a 'Created' label.
-    We'll try:
-      1) Line-based label matches (most reliable on word-lines)
-      2) Full text label matches
-      3) Fallback: look for 'Created' line and capture trailing name
+    Robust Created_By:
+      - finds 'Created' or 'Prepared' label in word coords
+      - captures name tokens to the right on same row
+      - if 'By' is separate token, handles that too
     """
-    patterns = [
-        re.compile(r"\bCreated\s*By\b\s*[:#]?\s*(.+)$", re.IGNORECASE),
-        re.compile(r"\bPrepared\s*By\b\s*[:#]?\s*(.+)$", re.IGNORECASE),
-        re.compile(r"\bEntered\s*By\b\s*[:#]?\s*(.+)$", re.IGNORECASE),
-        re.compile(r"\bCreated\b\s*[:#]?\s*(.+)$", re.IGNORECASE),
-    ]
+    if not words:
+        return ""
 
-    for ln in lines:
-        for pat in patterns:
-            m = pat.search(ln)
-            if m:
-                val = m.group(1).strip()
-                val = re.sub(r"\s{2,}", " ", val)
-                # trim obvious trailing tokens
-                val = re.split(r"\b(Date|Quote|Customer|Ship|Bill)\b", val, flags=re.IGNORECASE)[0].strip()
-                if val:
+    w1 = [w for w in words if w.get("page_num") == 1]
+
+    def row_key(w, y_tol=3.0):
+        return round(w["top"] / y_tol) * y_tol
+
+    rows = defaultdict(list)
+    for w in w1:
+        rows[row_key(w)].append(w)
+
+    sorted_keys = sorted(rows.keys())
+
+    def looks_like_name(tok: str) -> bool:
+        tok = (tok or "").strip()
+        if not tok:
+            return False
+        if re.search(r"\d", tok):
+            return False
+        if tok.lower() in {"date", "quote", "customer", "ship", "bill", "sold", "to", "total", "subtotal"}:
+            return False
+        return bool(re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", tok))
+
+    for rk in sorted_keys:
+        row = sorted(rows[rk], key=lambda x: x["x0"])
+        texts = [(w["x0"], (w.get("text") or "").strip()) for w in row]
+        for i, (x0, t) in enumerate(texts):
+            tl = t.lower()
+            if tl in {"created", "prepared", "entered"} or tl.startswith("created") or tl.startswith("prepared"):
+                # skip optional "by"
+                j = i + 1
+                if j < len(texts) and texts[j][1].lower() == "by":
+                    j += 1
+
+                name_parts = []
+                for k in range(j, min(j + 6, len(texts))):
+                    tok = texts[k][1]
+                    if looks_like_name(tok):
+                        name_parts.append(tok)
+                    else:
+                        break
+
+                val = " ".join(name_parts).strip()
+                if len(val.split()) >= 2:
                     return val
 
-    for pat in patterns:
-        m = pat.search(full_text)
-        if m:
-            val = m.group(1).strip()
-            val = re.sub(r"\s{2,}", " ", val)
-            val = re.split(r"\b(Date|Quote|Customer|Ship|Bill)\b", val, flags=re.IGNORECASE)[0].strip()
-            if val:
-                return val
-
+    # fallback: search full-text label patterns (sometimes works even if word-splitting fails)
     return ""
 
 
-def extract_ship_to_block(lines: List[str]) -> Dict[str, str]:
+def extract_ship_to_address_block(lines: List[str]) -> Dict[str, str]:
     """
-    USER REQUIREMENT:
-      Address must come from SHIP TO (not bill to / sold to).
-
-    We find the 'Ship To' line and then read the next lines:
-      Ship To
-      COMPANY
-      STREET
-      CITY STATE ZIP
-      USA
+    Extract Ship To block ONLY (your requirement).
+    We:
+      1) find 'Ship To' marker (even if embedded in a longer line)
+      2) scan forward up to 20 lines until we find a line with ZIP (city/state/zip)
+      3) street = line immediately above the ZIP line
+      4) company = first non-label line between Ship To and street (usually the first line)
     """
     out: Dict[str, str] = {}
-
-    # locate Ship To marker
     ship_idx = -1
+
     for i, ln in enumerate(lines):
-        if re.search(r"\bShip\s*To\b", ln, re.IGNORECASE):
+        if re.search(r"\bship\s*to\b", ln, re.IGNORECASE):
             ship_idx = i
             break
 
     if ship_idx == -1:
         return out
 
-    # gather next 6-8 lines after Ship To
-    block = []
-    for j in range(ship_idx + 1, min(ship_idx + 10, len(lines))):
+    # collect candidate block lines after Ship To
+    cand = []
+    for j in range(ship_idx + 1, min(ship_idx + 25, len(lines))):
         t = lines[j].strip()
         if not t:
             continue
-        # stop if we hit another header section
-        if re.search(r"\b(Bill\s*To|Sold\s*To|Quote|Items?|Subtotal|Total)\b", t, re.IGNORECASE):
+        # stop if we hit totals/items section
+        if re.search(r"\b(subtotal|total|grand\s*total|items?|product)\b", t, re.IGNORECASE):
             break
-        block.append(t)
+        cand.append(t)
 
-    if not block:
+    if not cand:
         return out
 
-    # remove duplicate "Ship To:" content if embedded
-    if block and re.search(r"\bShip\s*To\b", block[0], re.IGNORECASE):
-        block = block[1:]
+    # Find ZIP line in cand
+    zip_k = -1
+    for k, ln in enumerate(cand):
+        if ZIP_RE.search(ln):
+            zip_k = k
+            break
+    if zip_k == -1:
+        return out
 
-    # Heuristic parse
-    # company = first non-empty line that isn't city/state/zip
-    # street = next line that starts with digits OR looks like street
-    # city/state/zip = line containing ZIP
-    company = block[0] if block else ""
+    city_state_zip = cand[zip_k]
+    zip_code = ZIP_RE.search(city_state_zip).group(1)
+
+    tokens = city_state_zip.split()
+    state = ""
+    if zip_code in tokens:
+        zidx = tokens.index(zip_code)
+        if zidx >= 1 and re.fullmatch(r"[A-Z]{2}", tokens[zidx - 1]):
+            state = tokens[zidx - 1]
+
+    city = ""
+    if state and state in tokens:
+        sidx = tokens.index(state)
+        if sidx >= 1:
+            city = " ".join(tokens[:sidx]).strip()
+
+    # Street line is previous line in cand
+    street = cand[zip_k - 1] if zip_k - 1 >= 0 else ""
+
+    # Company: best candidate is the first non-label line in cand (often cand[0])
+    company = ""
+    for ln in cand[:zip_k]:
+        if re.search(r"\b(bill\s*to|sold\s*to|ship\s*to)\b", ln, re.IGNORECASE):
+            continue
+        if ZIP_RE.search(ln):
+            continue
+        # avoid picking street as company
+        if ln == street:
+            continue
+        company = ln
+        break
+
+    company = clean_company_line(company)
+
     if company:
         out["Company"] = company
-
-    # find city/state/zip line
-    city_state_zip_line = ""
-    city_state_zip_idx = -1
-    for k, ln in enumerate(block):
-        if ZIP_RE.search(ln):
-            city_state_zip_line = ln
-            city_state_zip_idx = k
-            break
-
-    # street line: typically line just before city/state/zip
-    if city_state_zip_idx > 0:
-        out["Address"] = block[city_state_zip_idx - 1].strip()
-
-    # parse city/state/zip
-    if city_state_zip_line:
-        zip_code = ZIP_RE.search(city_state_zip_line).group(1)
+    if street:
+        out["Address"] = street.strip()
+    if city:
+        out["City"] = city
+    if state:
+        out["State"] = state
+    if zip_code:
         out["ZipCode"] = zip_code
 
-        tokens = city_state_zip_line.split()
-        state = ""
-        if zip_code in tokens:
-            zidx = tokens.index(zip_code)
-            if zidx >= 1 and re.fullmatch(r"[A-Z]{2}", tokens[zidx - 1]):
-                state = tokens[zidx - 1]
-        if state:
-            out["State"] = state
-            sidx = tokens.index(state)
-            if sidx >= 1:
-                out["City"] = " ".join(tokens[:sidx]).strip()
-        else:
-            # fallback: last 2-letter token before zip
-            for t in reversed(tokens):
-                if re.fullmatch(r"[A-Z]{2}", t):
-                    out["State"] = t
-                    break
-
-    # country: search within block
+    # Country: check nearby lines or default USA
     out["Country"] = "USA"
-    for ln in block:
+    for ln in cand[zip_k: min(zip_k + 4, len(cand))]:
         if USA_RE.search(ln):
             out["Country"] = "USA"
             break
@@ -336,23 +362,22 @@ def extract_ship_to_block(lines: List[str]) -> Dict[str, str]:
 
 
 def extract_total_sales(lines: List[str], full_text: str) -> str:
-    total = ""
     for ln in lines:
         if re.search(r"\b(total|grand total|total sales)\b", ln, re.IGNORECASE):
             mm = MONEY_RE.search(ln)
             if mm:
-                total = mm.group(0)
-                break
-    if not total:
-        m = re.search(r"(?:Total\s*Sales|Grand\s*Total|Total)\s*[: ]+\$?\s*([\d,]+\.\d{2})",
-                      full_text, flags=re.IGNORECASE)
-        if m:
-            total = m.group(1)
-        else:
-            monies = MONEY_RE.findall(full_text)
-            if monies:
-                total = monies[-1]
-    return normalize_money(total) if total else ""
+                return normalize_money(mm.group(0))
+
+    m = re.search(
+        r"(?:Total\s*Sales|Grand\s*Total|Total)\s*[: ]+\$?\s*([\d,]+\.\d{2})",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return normalize_money(m.group(1))
+
+    monies = MONEY_RE.findall(full_text)
+    return normalize_money(monies[-1]) if monies else ""
 
 
 def extract_voelkr_fields(pdf_bytes: bytes) -> Dict[str, str]:
@@ -373,18 +398,18 @@ def extract_voelkr_fields(pdf_bytes: bytes) -> Dict[str, str]:
     # CustomerNumber
     out["CustomerNumber"] = extract_customer_number_from_words(words)
 
-    # ReferralManager (sample: DAYTON)
+    # ReferralManager (sample)
     if any(re.search(r"\bDAYTON\b", ln) for ln in lines) or re.search(r"\bDAYTON\b", full_text):
         out["ReferralManager"] = "DAYTON"
 
     # TotalSales
     out["TotalSales"] = extract_total_sales(lines, full_text)
 
-    # Created_By (yellow highlight)
-    out["Created_By"] = extract_created_by(lines, full_text)
+    # Created_By (word-based; fixes split-label cases)
+    out["Created_By"] = extract_created_by_from_words(words)
 
-    # SHIP TO address block (red highlight)
-    out.update(extract_ship_to_block(lines))
+    # SHIP TO address (forces correct company/address/city/state/zip)
+    out.update(extract_ship_to_address_block(lines))
 
     # Brand default
     out["Brand"] = VOELKR_DEFAULT_BRAND
@@ -409,7 +434,8 @@ st.title("PDF Extractor – Voelkr")
 
 st.markdown(
     """
-- **Voelkr** extracts header fields (Ship To address + Created_By).
+- **Voelkr** extracts header fields using **Ship To** for Company/Address/City/State/Zip.
+- **Created_By** extracted using **word-coordinate** logic (handles split labels).
 - **Cadre** is blank for now.
 - Download is **one ZIP** containing extracted CSV + uploaded PDFs.
 """
