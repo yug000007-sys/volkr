@@ -152,7 +152,6 @@ def extract_total_sales(full_text: str) -> str:
 def find_ship_to_anchor(rows: List[Dict[str, Any]]) -> Optional[dict]:
     for i, r in enumerate(rows):
         toks = row_tokens_norm(r["words"])
-        # token-based: works even if "Ship" and "To" are split
         if "ship" in toks and "to" in toks:
             ship_ws = [w for w in r["words"] if w["text_norm"] == "ship"]
             to_ws = [w for w in r["words"] if w["text_norm"] == "to"]
@@ -172,14 +171,19 @@ def _looks_like_street(s: str) -> bool:
     return bool(re.match(r"^\d{2,6}\s+", s))
 
 
+def _looks_like_country_only(s: str) -> bool:
+    s = clean_text(s).upper()
+    return s in {"USA", "UNITED STATES", "UNITED STATES OF AMERICA"}
+
+
 def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
     """
-    STRICT Ship To parsing (ALWAYS use Ship To):
-      - Find Ship+To token anchor
-      - Read next lines in same column window
-      - Identify city/state/zip line by ZIP
-      - Street = nearest line above ZIP that looks like a street
-      - Company = nearest non-street/non-city line above street
+    FIX: Company selection is now robust.
+    We pick:
+      - city/state/zip line by ZIP
+      - street = nearest line above zip that looks like street
+      - company = nearest non-street/non-city/non-country line ABOVE street
+      - if company missing, fallback to row between 'Ship To' line and street line
     """
     rows = group_rows(words, page=1, y_tol=3.0)
     anchor = find_ship_to_anchor(rows)
@@ -187,25 +191,29 @@ def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
         return {}
 
     start_i = anchor["row_idx"] + 1
-    # widen window to avoid losing company line due to column spacing
-    col_left = max(0, anchor["x0"] - 80)
-    col_right = anchor["x1"] + 650
+    col_left = max(0, anchor["x0"] - 100)
+    col_right = anchor["x1"] + 800
 
+    # collect ship-to block lines in same column window
     block_lines: List[str] = []
-    for j in range(start_i, min(start_i + 18, len(rows))):
+    for j in range(start_i, min(start_i + 22, len(rows))):
         row_words = rows[j]["words"]
         in_col = [w for w in row_words if w["x0"] >= col_left and w["x1"] <= col_right]
         line = clean_text(" ".join(w["text"] for w in in_col))
+
         if not line:
             continue
-        if re.search(r"\b(bill\s*to|sold\s*to|subtotal|total|items?|product)\b", line, re.IGNORECASE):
+
+        # stop when we clearly hit another section
+        if re.search(r"\b(bill\s*to|sold\s*to|subtotal|grand\s*total|total\b|items?|product)\b", line, re.IGNORECASE):
             break
+
         block_lines.append(line)
 
     if not block_lines:
         return {}
 
-    # city/state/zip = first line containing ZIP
+    # locate city/state/zip
     zip_i = None
     for k, ln in enumerate(block_lines):
         if ZIP_RE.search(ln):
@@ -222,7 +230,7 @@ def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
         state = m.group(2)
         zipc = m.group(3)
 
-    # street = closest line above zip line that looks like street
+    # street = closest above ZIP line that looks like street
     street = ""
     street_i = None
     for k in range(zip_i - 1, -1, -1):
@@ -231,7 +239,7 @@ def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
             street_i = k
             break
 
-    # company = closest meaningful line above street (NOT street, NOT city/state/zip)
+    # company = closest meaningful line above street
     company = ""
     if street_i is not None:
         for k in range(street_i - 1, -1, -1):
@@ -242,27 +250,31 @@ def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
                 continue
             if _looks_like_street(cand):
                 continue
-            if cand.upper() in {"USA", "UNITED STATES", "UNITED STATES OF AMERICA"}:
+            if _looks_like_country_only(cand):
                 continue
             company = cand
             break
 
-    # fallback: first line before zip that isn't street/city
-    if not company and zip_i >= 1:
-        for cand in block_lines[:zip_i]:
-            if cand and not _looks_like_city_state_zip(cand) and not _looks_like_street(cand):
+        # fallback: if still empty, try any non-empty non-zip line above street
+        if not company:
+            for k in range(0, street_i):
+                cand = block_lines[k].strip()
+                if not cand:
+                    continue
+                if _looks_like_city_state_zip(cand) or _looks_like_street(cand) or _looks_like_country_only(cand):
+                    continue
                 company = cand
                 break
 
-    # remove street duplication if any
+    # street de-dup
     street_tokens = street.split()
     if len(street_tokens) >= 4:
         half = len(street_tokens) // 2
         if street_tokens[:half] == street_tokens[half:]:
             street = " ".join(street_tokens[:half])
 
-    # guardrails
-    if _looks_like_city_state_zip(company) or _looks_like_street(company):
+    # final guardrails
+    if _looks_like_city_state_zip(company) or _looks_like_street(company) or _looks_like_country_only(company):
         company = ""
 
     return {
@@ -325,8 +337,7 @@ def extract_created_by(words: List[dict], full_text: str) -> str:
     )
     if m:
         return clean_text(m.group(2))
-    m = re.search(r"\b(Loghan\s+Keefer)\b", full_text, re.IGNORECASE)
-    return "Loghan Keefer" if m else ""
+    return ""
 
 
 def extract_referral_manager(words: List[dict], full_text: str) -> str:
@@ -338,9 +349,10 @@ def extract_referral_manager(words: List[dict], full_text: str) -> str:
                 txt = w["text"].strip()
                 if re.fullmatch(r"[A-Z]{3,}", txt) and txt.lower() not in {"cust", "customer"}:
                     return txt
-    if re.search(r"\bDAYTON\b", full_text):
-        return "DAYTON"
-    return ""
+
+    # fallback to first ALLCAPS token that appears in header (works for DAYTON-type reps)
+    m = re.search(r"\b([A-Z]{3,})\b", full_text)
+    return m.group(1) if m else ""
 
 
 def parse_voelkr(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
