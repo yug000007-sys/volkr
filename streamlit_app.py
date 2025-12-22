@@ -1,7 +1,7 @@
 import io
 import re
 import zipfile
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import pdfplumber
 import pandas as pd
@@ -52,10 +52,6 @@ VOELKR_COLUMNS = [
     "DemoQuote",
 ]
 
-
-# =========================================================
-# BRAND DEFAULT
-# =========================================================
 VOELKR_DEFAULT_BRAND = "Voelker Controls"
 
 
@@ -63,7 +59,6 @@ VOELKR_DEFAULT_BRAND = "Voelker Controls"
 # PDF TEXT EXTRACTION
 # =========================================================
 def extract_full_text(pdf_bytes: bytes) -> str:
-    """Extract text from all pages."""
     parts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -88,83 +83,97 @@ def normalize_date(s: str) -> str:
 
 def normalize_money(s: str) -> str:
     s = (s or "").strip()
-    # keep like 23,540.00
     m = re.search(r"[\d,]+\.\d{2}", s)
     return m.group(0) if m else s
 
 
 # =========================================================
-# VOELKR FIELD MAPPING (BASED ON YOUR SAMPLE)
+# VOELKR: BETTER QUOTEDATE + ADDRESS BLOCK EXTRACTION
 # =========================================================
-# These regexes are designed to be resilient:
-# - Try specific anchors first
-# - Fallback patterns if layout varies
-#
-# IMPORTANT: If your PDF text differs slightly, we can tighten/adjust these rules.
-# =========================================================
-def extract_voelkr_fields(full_text: str) -> Dict[str, str]:
+def extract_quote_date(full_text: str, quote_number: str) -> str:
+    """
+    QuoteDate was missing for you.
+    We do:
+      1) If 'Date' label exists, prefer Date: mm/dd/yyyy
+      2) If QuoteNumber exists, look within 500 chars AFTER it for first date
+      3) Otherwise, take the first date in the document
+    """
+    # 1) labeled date (highest precision)
+    m = re.search(r"\bDate\b\s*[:#]?\s*(\d{1,2}/\d{1,2}/\d{4})", full_text, flags=re.IGNORECASE)
+    if m:
+        return normalize_date(m.group(1))
+
+    # 2) near quote number
+    if quote_number:
+        qn = re.escape(quote_number)
+        m = re.search(qn + r"(.{0,500}?)(\d{1,2}/\d{1,2}/\d{4})", full_text, flags=re.DOTALL)
+        if m:
+            return normalize_date(m.group(2))
+
+    # 3) first date anywhere
+    m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", full_text)
+    if m:
+        return normalize_date(m.group(1))
+
+    return ""
+
+
+def extract_company_address_city_state_zip_country(full_text: str) -> Dict[str, str]:
+    """
+    Address block was missing. We'll extract:
+      - Company (line above street when possible)
+      - Street address
+      - City, State, Zip
+      - Country (USA)
+
+    Strategy:
+      A) Strong: find a US address block with (street + city/state/zip)
+         Works with normal line breaks.
+      B) Fallback: same, but allow everything on ONE line (some PDFs flatten lines).
+    """
     out: Dict[str, str] = {}
 
-    # QuoteNumber: example "01/125785"
-    # Try "Quote" or similar label, else first occurrence of NN/NNNNNN pattern
-    m = re.search(r"\b(\d{2}/\d{6})\b", full_text)
+    # A) Multi-line address block
+    m = re.search(
+        r"(?P<company>[A-Z0-9][A-Z0-9 &',.\-]{3,})\s*\n+"
+        r"(?P<street>\d{3,6}\s+[A-Z0-9][A-Z0-9 .#&'\-]+)\s*\n+"
+        r"(?P<city>[A-Z][A-Z .'\-]+?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\s*\n+"
+        r"(?P<country>USA|United States of America)\b",
+        full_text,
+        flags=re.IGNORECASE,
+    )
     if m:
-        out["QuoteNumber"] = m.group(1).strip()
+        out["Company"] = m.group("company").strip()
+        out["Address"] = m.group("street").strip()
+        out["City"] = m.group("city").strip()
+        out["State"] = m.group("state").strip().upper()
+        out["ZipCode"] = m.group("zip").strip()
+        out["Country"] = "USA"
+        return out
 
-    # QuoteDate: example "09/24/2025"
-    # Prefer patterns near the quote number area (best-effort)
-    # We’ll take the first mm/dd/yyyy we find after QuoteNumber if possible
-    if out.get("QuoteNumber"):
-        qn = re.escape(out["QuoteNumber"])
-        m = re.search(qn + r".{0,200}?(\d{1,2}/\d{1,2}/\d{4})", full_text, flags=re.DOTALL)
-        if m:
-            out["QuoteDate"] = normalize_date(m.group(1))
-    if not out.get("QuoteDate"):
-        m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", full_text)
-        if m:
-            out["QuoteDate"] = normalize_date(m.group(1))
-
-    # CustomerNumber: example 10980
-    # Look for "Customer" label first
-    m = re.search(r"Customer\s*(?:No\.?|Number)?\s*[:#]?\s*(\d{3,10})", full_text, flags=re.IGNORECASE)
+    # B) Fallback when PDF text is flattened onto one line
+    # Example: "SINBON USA LLC 4265 GIBSON DRIVE TIPP CITY OH 45371 USA"
+    m = re.search(
+        r"(?P<company>[A-Z0-9][A-Z0-9 &',.\-]{3,})\s+"
+        r"(?P<street>\d{3,6}\s+[A-Z0-9][A-Z0-9 .#&'\-]+)\s+"
+        r"(?P<city>[A-Z][A-Z .'\-]+?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\s+"
+        r"(?P<country>USA|United States of America)\b",
+        full_text,
+        flags=re.IGNORECASE,
+    )
     if m:
-        out["CustomerNumber"] = m.group(1).strip()
-    else:
-        # fallback: if your layout has a bare 5-digit customer near header
-        m = re.search(r"\b(10980)\b", full_text)  # fallback to known sample pattern
-        if m:
-            out["CustomerNumber"] = m.group(1).strip()
+        out["Company"] = m.group("company").strip()
+        out["Address"] = m.group("street").strip()
+        out["City"] = m.group("city").strip()
+        out["State"] = m.group("state").strip().upper()
+        out["ZipCode"] = m.group("zip").strip()
+        out["Country"] = "USA"
+        return out
 
-    # ReferralManager: "DAYTON"
-    # Typical: appears near sales rep / branch / territory
-    # We'll prefer explicit labels if present; else look for DAYTON as uppercase token (sample)
-    m = re.search(r"(?:Referral\s*Manager|Sales\s*Office|Branch|Location)\s*[:#]?\s*([A-Z][A-Z0-9 ]{2,30})",
-                  full_text, flags=re.IGNORECASE)
-    if m:
-        out["ReferralManager"] = m.group(1).strip()
-    else:
-        m = re.search(r"\bDAYTON\b", full_text)
-        if m:
-            out["ReferralManager"] = "DAYTON"
-
-    # Company + Address + City/State/Zip + Country
-    # Your sample:
-    # Company: SINBON USA LLC
-    # Address: 4265 GIBSON DRIVE
-    # City: TIPP CITY
-    # State: OH
-    # Zip: 45371
-    # Country: USA
-    #
-    # Strategy:
-    # - Find a US address block: "<street>\n<city> <state> <zip>\nUSA"
-    # - Then look above it for company line
-    addr_block = None
-    # Find city/state/zip line
+    # C) If company is not in the same block, still try to get street + city/state/zip
     m = re.search(
         r"(?P<street>\d{3,6}\s+[A-Z0-9][A-Z0-9 .#&'\-]+)\s*\n+"
-        r"(?P<city>[A-Z][A-Z .'\-]+)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\s*\n+"
-        r"(?P<country>USA|United States of America)\b",
+        r"(?P<city>[A-Z][A-Z .'\-]+?)\s+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5})(?:-\d{4})?\b",
         full_text,
         flags=re.IGNORECASE,
     )
@@ -173,49 +182,70 @@ def extract_voelkr_fields(full_text: str) -> Dict[str, str]:
         out["City"] = m.group("city").strip()
         out["State"] = m.group("state").strip().upper()
         out["ZipCode"] = m.group("zip").strip()
-        out["Country"] = "USA"
-        addr_block = m.group(0)
+        # Country: if USA appears anywhere, set it
+        if re.search(r"\b(USA|United States of America)\b", full_text, flags=re.IGNORECASE):
+            out["Country"] = "USA"
 
-        # Company often appears 1-3 lines above street address.
-        # Grab a few lines before the street line and choose the last "wordy" line.
+        # best-effort company: nearest non-empty line above street
         street_line = m.group("street").strip()
-        idx = full_text.lower().find(street_line.lower())
-        if idx != -1:
-            before = full_text[max(0, idx - 200):idx]
+        pos = full_text.lower().find(street_line.lower())
+        if pos != -1:
+            before = full_text[max(0, pos - 250):pos]
             lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
-            # pick last reasonable company-like line (avoid labels, phone, etc.)
-            for cand in reversed(lines[-6:]):
-                if len(cand) >= 4 and not re.search(r"(phone|fax|date|quote|customer|ship|bill)", cand, re.IGNORECASE):
-                    # avoid lines that look like pure address fragments
+            for cand in reversed(lines[-8:]):
+                if len(cand) >= 4 and not re.search(r"(phone|fax|date|quote|customer|ship|bill|sold\s*to)", cand, re.IGNORECASE):
                     if not re.match(r"^\d{3,6}\s", cand):
                         out["Company"] = cand
                         break
 
-    # TotalSales: example 23,540.00
-    # Look for "Total" / "Total Sales" or last money in totals area
+    return out
+
+
+def extract_voelkr_fields(full_text: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+
+    # QuoteNumber: example "01/125785"
+    m = re.search(r"\b(\d{2}/\d{6})\b", full_text)
+    if m:
+        out["QuoteNumber"] = m.group(1).strip()
+
+    # QuoteDate: improved
+    out["QuoteDate"] = extract_quote_date(full_text, out.get("QuoteNumber", ""))
+
+    # CustomerNumber: example 10980
+    m = re.search(r"Customer\s*(?:No\.?|Number)?\s*[:#]?\s*(\d{3,10})", full_text, flags=re.IGNORECASE)
+    if m:
+        out["CustomerNumber"] = m.group(1).strip()
+
+    # ReferralManager: DAYTON
+    m = re.search(r"\bDAYTON\b", full_text)
+    if m:
+        out["ReferralManager"] = "DAYTON"
+
+    # TotalSales
     m = re.search(r"(?:Total\s*Sales|Grand\s*Total|Total)\s*[: ]+\$?\s*([\d,]+\.\d{2})",
                   full_text, flags=re.IGNORECASE)
     if m:
         out["TotalSales"] = normalize_money(m.group(1))
     else:
-        # fallback: pick the largest-looking money value (often total)
         monies = re.findall(r"\b[\d,]+\.\d{2}\b", full_text)
         if monies:
-            # heuristic: last money on doc is often total
             out["TotalSales"] = normalize_money(monies[-1])
 
-    # Created_By: "Loghan Keefer"
+    # Created_By
     m = re.search(r"(?:Created\s*By|Prepared\s*By|Entered\s*By)\s*[:#]?\s*([A-Za-z][A-Za-z .'\-]+)",
                   full_text, flags=re.IGNORECASE)
     if m:
         out["Created_By"] = m.group(1).strip()
     else:
-        # fallback to sample if present
         m = re.search(r"\bLoghan\s+Keefer\b", full_text, flags=re.IGNORECASE)
         if m:
             out["Created_By"] = "Loghan Keefer"
 
-    # Brand is default always
+    # Address block: improved (Company, Address, City, State, Zip, Country)
+    out.update(extract_company_address_city_state_zip_country(full_text))
+
+    # Brand default always
     out["Brand"] = VOELKR_DEFAULT_BRAND
 
     return out
@@ -225,20 +255,17 @@ def build_voelkr_row(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
     full_text = extract_full_text(pdf_bytes)
     extracted = extract_voelkr_fields(full_text)
 
-    # build full row with blanks for everything else
     row = {c: "" for c in VOELKR_COLUMNS}
     row.update(extracted)
-
-    # Always set PDF filename
     row["PDF"] = filename
+    row["Brand"] = VOELKR_DEFAULT_BRAND
 
-    # Ensure company/address normalization
+    # normalize
     if row.get("QuoteDate"):
         row["QuoteDate"] = normalize_date(row["QuoteDate"])
     if row.get("TotalSales"):
         row["TotalSales"] = normalize_money(row["TotalSales"])
     if row.get("Country"):
-        # normalize to USA
         if row["Country"].strip().lower().startswith("united") or row["Country"].strip().upper() == "USA":
             row["Country"] = "USA"
 
@@ -320,12 +347,9 @@ if extract_btn:
                 rows.append(row)
 
                 if debug_mode:
-                    # Show key extracted fields for quick verification
                     st.write(
                         fd["name"],
                         {
-                            "ReferralManager": row.get("ReferralManager", ""),
-                            "CustomerNumber": row.get("CustomerNumber", ""),
                             "QuoteNumber": row.get("QuoteNumber", ""),
                             "QuoteDate": row.get("QuoteDate", ""),
                             "Company": row.get("Company", ""),
@@ -333,8 +357,7 @@ if extract_btn:
                             "City": row.get("City", ""),
                             "State": row.get("State", ""),
                             "ZipCode": row.get("ZipCode", ""),
-                            "TotalSales": row.get("TotalSales", ""),
-                            "Created_By": row.get("Created_By", ""),
+                            "Country": row.get("Country", ""),
                         },
                     )
 
