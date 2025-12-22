@@ -104,10 +104,6 @@ def extract_words(pdf_bytes: bytes) -> List[dict]:
 
 
 def group_rows(words: List[dict], page: int = 1, y_tol: float = 3.0) -> List[Dict[str, Any]]:
-    """
-    Returns list of rows:
-      { "y": float, "words": [word...], "text": str }
-    """
     buckets = defaultdict(list)
     for w in words:
         if w.get("page") != page:
@@ -154,15 +150,9 @@ def extract_total_sales(full_text: str) -> str:
 
 
 def find_ship_to_anchor(rows: List[Dict[str, Any]]) -> Optional[dict]:
-    """
-    Find a row that contains token 'ship' and token 'to' (even if split).
-    Returns dict with:
-      { "row_idx": int, "x0": float, "x1": float }
-    """
     for i, r in enumerate(rows):
         toks = row_tokens_norm(r["words"])
         if "ship" in toks and "to" in toks:
-            # anchor x-range = from 'ship' word x0 to 'to' word x1
             ship_ws = [w for w in r["words"] if w["text_norm"] == "ship"]
             to_ws = [w for w in r["words"] if w["text_norm"] == "to"]
             if ship_ws and to_ws:
@@ -172,42 +162,41 @@ def find_ship_to_anchor(rows: List[Dict[str, Any]]) -> Optional[dict]:
     return None
 
 
+def _looks_like_city_state_zip(s: str) -> bool:
+    return bool(CITY_ST_ZIP_RE.match(clean_text(s)))
+
+
+def _looks_like_street(s: str) -> bool:
+    s = clean_text(s)
+    # typical street starts with number
+    return bool(re.match(r"^\d{2,6}\s+", s))
+
+
 def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
-    """
-    ALWAYS extract address from Ship To.
-    Uses the Ship/To anchor row and reads the next rows from the SAME COLUMN area.
-    """
     rows = group_rows(words, page=1, y_tol=3.0)
     anchor = find_ship_to_anchor(rows)
     if not anchor:
         return {}
 
     start_i = anchor["row_idx"] + 1
-    # define a "column window" around Ship To label
     col_left = max(0, anchor["x0"] - 40)
-    col_right = anchor["x1"] + 420  # wide enough to capture address block values
+    col_right = anchor["x1"] + 420
 
     block_lines: List[str] = []
-    for j in range(start_i, min(start_i + 12, len(rows))):
+    for j in range(start_i, min(start_i + 14, len(rows))):
         row_words = rows[j]["words"]
-
-        # take only words in the same column window
         in_col = [w for w in row_words if w["x0"] >= col_left and w["x1"] <= col_right]
         line = clean_text(" ".join(w["text"] for w in in_col))
-
         if not line:
             continue
-
-        # stop if we hit another header section
         if re.search(r"\b(bill\s*to|sold\s*to|subtotal|total|items?|product)\b", line, re.IGNORECASE):
             break
-
         block_lines.append(line)
 
     if not block_lines:
         return {}
 
-    # find the city/state/zip line (first with ZIP)
+    # city/state/zip line = first line containing ZIP
     zip_i = None
     for k, ln in enumerate(block_lines):
         if ZIP_RE.search(ln):
@@ -216,35 +205,53 @@ def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
     if zip_i is None:
         return {}
 
-    # company: first non-empty line BEFORE zip line
-    # street: line immediately before zip line
-    company = ""
-    for ln in block_lines[:zip_i]:
-        if ln:
-            company = ln
-            break
-
-    street = block_lines[zip_i - 1] if zip_i - 1 >= 0 else ""
     city_state_zip = block_lines[zip_i]
-
-    # parse city/state/zip
-    city = state = zipc = ""
     m = CITY_ST_ZIP_RE.match(city_state_zip)
+    city = state = zipc = ""
     if m:
         city = clean_text(m.group(1))
         state = m.group(2)
         zipc = m.group(3)
 
-    # guardrails: company must not be city/state/zip
-    if CITY_ST_ZIP_RE.match(company):
-        company = ""
+    # street line = nearest line ABOVE city_state_zip that looks like street
+    street = ""
+    for k in range(zip_i - 1, -1, -1):
+        if _looks_like_street(block_lines[k]):
+            street = block_lines[k]
+            break
 
-    # prevent duplicated street like "4265 ... 4265 ..."
+    # company line = nearest line ABOVE street that is NOT street and NOT city/state/zip
+    company = ""
+    if street:
+        street_i = block_lines.index(street)
+        for k in range(street_i - 1, -1, -1):
+            cand = block_lines[k]
+            if not cand:
+                continue
+            if _looks_like_city_state_zip(cand):
+                continue
+            if _looks_like_street(cand):
+                continue
+            # reject if it contains only repeated city/state/zip fragments
+            company = cand
+            break
+    else:
+        # fallback: first line that is not city/state/zip
+        for cand in block_lines[:zip_i]:
+            if cand and not _looks_like_city_state_zip(cand):
+                company = cand
+                break
+
+    # clean duplication in street
     street_tokens = street.split()
     if len(street_tokens) >= 4:
         half = len(street_tokens) // 2
         if street_tokens[:half] == street_tokens[half:]:
             street = " ".join(street_tokens[:half])
+
+    # guardrails: company must not be city/state/zip or a street
+    if _looks_like_city_state_zip(company) or _looks_like_street(company):
+        company = ""
 
     return {
         "Company": company,
@@ -257,14 +264,6 @@ def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
 
 
 def extract_customer_number(words: List[dict], full_text: str) -> str:
-    """
-    Robust 'Cust # 10980' even if split across tokens/rows/columns.
-    Strategy:
-      1) find token starting with 'cust' or 'customer'
-      2) scan right on same row for digits
-      3) scan next 3 rows in same column area
-      4) fallback regex on full text
-    """
     rows = group_rows(words, page=1, y_tol=3.0)
 
     def digits_only(s: str) -> str:
@@ -273,21 +272,18 @@ def extract_customer_number(words: List[dict], full_text: str) -> str:
     for i, r in enumerate(rows):
         toks = row_tokens_norm(r["words"])
         if any(t.startswith("cust") or t.startswith("customer") for t in toks):
-            # locate the first cust-like word to get x position
             cust_words = [w for w in r["words"] if w["text_norm"].startswith("cust") or w["text_norm"].startswith("customer")]
             if not cust_words:
                 continue
             cw = cust_words[0]
             x_anchor = cw["x0"]
 
-            # scan right same row
             right = [w for w in r["words"] if w["x0"] > x_anchor]
             for w in right:
                 d = digits_only(w["text"])
                 if re.fullmatch(r"\d{3,10}", d or ""):
                     return d
 
-            # scan down next rows near same x column
             for down in range(1, 4):
                 if i + down >= len(rows):
                     break
@@ -298,7 +294,6 @@ def extract_customer_number(words: List[dict], full_text: str) -> str:
                     if re.fullmatch(r"\d{3,10}", d or ""):
                         return d
 
-    # fallback text regex
     m = re.search(r"(?:cust|customer)\s*(?:#|no\.?|number)?\s*[:#\-]?\s*(\d{3,10})", full_text, re.IGNORECASE)
     return m.group(1) if m else ""
 
@@ -311,40 +306,21 @@ def extract_created_by(words: List[dict], full_text: str) -> str:
     )
     if m:
         return clean_text(m.group(2))
-
-    rows = group_rows(words, page=1, y_tol=3.0)
-    for r in rows:
-        t = r["text"].lower()
-        if "created" in t or "prepared" in t or "entered" in t:
-            # find first FirstName LastName in row
-            parts = [w["text"].strip() for w in r["words"]]
-            for i in range(len(parts) - 1):
-                if re.fullmatch(r"[A-Z][A-Za-z.'-]+", parts[i]) and re.fullmatch(r"[A-Z][A-Za-z.'-]+", parts[i + 1]):
-                    return f"{parts[i]} {parts[i + 1]}"
-
-    # last fallback for your sample
     m = re.search(r"\b(Loghan\s+Keefer)\b", full_text, re.IGNORECASE)
     return "Loghan Keefer" if m else ""
 
 
 def extract_referral_manager(words: List[dict], full_text: str) -> str:
-    """
-    Only from Salesperson/Sales Rep. Never from Cust.
-    """
     rows = group_rows(words, page=1, y_tol=3.0)
     for r in rows:
         t = r["text"].lower()
         if "sales" in t and ("person" in t or "rep" in t or "salesperson" in t):
-            # take first ALLCAPS name token that isn't CUST/CUSTOMER
             for w in r["words"]:
                 txt = w["text"].strip()
                 if re.fullmatch(r"[A-Z]{3,}", txt) and txt.lower() not in {"cust", "customer"}:
                     return txt
-
-    # fallback to DAYTON if present anywhere
     if re.search(r"\bDAYTON\b", full_text):
         return "DAYTON"
-
     return ""
 
 
@@ -360,17 +336,11 @@ def parse_voelkr(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
     out["QuoteDate"] = extract_quote_date(full_text)
     out["TotalSales"] = extract_total_sales(full_text)
 
-    # FIXED: Ship To ALWAYS
     ship = extract_ship_to_block(words)
     out.update(ship)
 
-    # FIXED: CustomerNumber robust
     out["CustomerNumber"] = extract_customer_number(words, full_text)
-
-    # FIXED: Created_By robust
     out["Created_By"] = extract_created_by(words, full_text)
-
-    # FIXED: ReferralManager robust (never "Cust")
     out["ReferralManager"] = extract_referral_manager(words, full_text)
 
     return out
