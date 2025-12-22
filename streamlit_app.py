@@ -60,8 +60,8 @@ VOELKR_COLUMNS = [
 # =========================================================
 QUOTE_NO_RE = re.compile(r"\b(\d{2}/\d{6})\b")
 DATE_RE = re.compile(r"\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b")
-ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
-CITY_ST_ZIP_RE = re.compile(r"^(.*)\s+([A-Z]{2})\s+(\d{5})(?:-\d{4})?$")
+ZIP5_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
+CITY_ST_ZIP_RE = re.compile(r"^(.*?)\s+([A-Z]{2})\s+(\d{5})(?:-\d{4})?$")
 MONEY_RE = re.compile(r"\b([\d,]+\.\d{2})\b")
 
 
@@ -98,6 +98,7 @@ def extract_words(pdf_bytes: bytes) -> List[dict]:
             ws = page.extract_words(x_tolerance=2, y_tolerance=2, use_text_flow=True) or []
             for w in ws:
                 w["page"] = page.page_number
+                # normalized text for token matching
                 w["text_norm"] = (
                     (w.get("text") or "")
                     .strip()
@@ -161,7 +162,7 @@ def extract_total_sales(full_text: str) -> str:
 
 def find_ship_to_anchor(rows: List[Dict[str, Any]]) -> Optional[dict]:
     """
-    Finds 'Ship' + 'To' even if split into separate tokens.
+    Match 'Ship To' even if split into separate tokens or has punctuation.
     """
     for i, r in enumerate(rows):
         toks = row_tokens_norm(r["words"])
@@ -175,10 +176,6 @@ def find_ship_to_anchor(rows: List[Dict[str, Any]]) -> Optional[dict]:
     return None
 
 
-def _looks_like_city_state_zip(s: str) -> bool:
-    return bool(CITY_ST_ZIP_RE.match(clean_text(s)))
-
-
 def _looks_like_street(s: str) -> bool:
     s = clean_text(s)
     return bool(re.match(r"^\d{2,6}\s+", s))
@@ -189,11 +186,60 @@ def _looks_like_country_only(s: str) -> bool:
     return s in {"USA", "UNITED STATES", "UNITED STATES OF AMERICA"}
 
 
+def _parse_city_state_zip(line: str) -> Dict[str, str]:
+    """
+    Handles:
+      'TRENTON OH 45067-9760'
+      'TIPP CITY OH 45371'
+    """
+    line = clean_text(line)
+    # normalize "City, ST ZIP" -> "City ST ZIP"
+    line = line.replace(",", " ")
+    line = re.sub(r"\s{2,}", " ", line).strip()
+
+    # Find ZIP (5 or 9)
+    mzip = re.search(r"\b(\d{5})(?:-(\d{4}))?\b", line)
+    if not mzip:
+        return {"City": "", "State": "", "ZipCode": ""}
+
+    zip5 = mzip.group(1)
+    # take the token just before zip as state, and everything before that as city
+    before = line[: mzip.start()].strip()
+    parts = before.split()
+    if len(parts) < 2:
+        return {"City": before, "State": "", "ZipCode": zip5}
+
+    state = parts[-1]
+    city = " ".join(parts[:-1]).strip()
+
+    # guard: state should be 2 letters
+    if not re.fullmatch(r"[A-Z]{2}", state.upper()):
+        # fallback to regex City ST ZIP
+        m = CITY_ST_ZIP_RE.match(re.sub(r"\b(\d{5})(?:-\d{4})?\b", zip5, line))
+        if m:
+            return {"City": clean_text(m.group(1)), "State": m.group(2), "ZipCode": zip5}
+        return {"City": before, "State": "", "ZipCode": zip5}
+
+    return {"City": clean_text(city), "State": state.upper(), "ZipCode": zip5}
+
+
 def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
     """
-    Always pick address from Ship To.
-    Company is chosen as the first meaningful non-street/non-city/non-country line
-    ABOVE the street line within the Ship To block, with extra fallbacks.
+    Required behavior:
+      Company/Address/City/State/Zip MUST come from Ship To.
+
+    Robust rules based on your sample:
+      Ship To:
+        TRENTON BREWERY
+        2525 WAYNE MADISON ROAD
+        TRENTON OH 45067-9760
+
+    Implementation:
+      1) find Ship To anchor row
+      2) take next non-empty lines in the Ship To column window
+      3) Company = first meaningful line (not street, not city/state/zip, not country)
+      4) Address = first street-like line after company
+      5) City/State/Zip = first line containing ZIP after address/company
     """
     rows = group_rows(words, page=1, y_tol=3.0)
     anchor = find_ship_to_anchor(rows)
@@ -201,98 +247,82 @@ def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
         return {}
 
     start_i = anchor["row_idx"] + 1
-    # Wider window to ensure company text isn't dropped
     col_left = max(0, anchor["x0"] - 160)
     col_right = anchor["x1"] + 900
 
-    block_lines: List[str] = []
-    for j in range(start_i, min(start_i + 28, len(rows))):
+    # collect candidate lines under Ship To
+    lines: List[str] = []
+    for j in range(start_i, min(start_i + 30, len(rows))):
         row_words = rows[j]["words"]
         in_col = [w for w in row_words if w["x0"] >= col_left and w["x1"] <= col_right]
         line = clean_text(" ".join(w["text"] for w in in_col))
         if not line:
             continue
-        if re.search(
-            r"\b(bill\s*to|sold\s*to|subtotal|grand\s*total|total\b|items?|product)\b",
-            line,
-            re.IGNORECASE,
-        ):
-            break
-        block_lines.append(line)
 
-    if not block_lines:
+        # stop when leaving ship-to block
+        if re.search(r"\b(bill\s*to|sold\s*to|subtotal|grand\s*total|total\b|items?|product)\b", line, re.IGNORECASE):
+            break
+
+        lines.append(line)
+
+    if not lines:
         return {}
 
-    # Find first line containing ZIP -> city/state/zip
+    # identify city/state/zip line index = first line with ZIP
     zip_i = None
-    for k, ln in enumerate(block_lines):
-        if ZIP_RE.search(ln):
-            zip_i = k
-            break
-    if zip_i is None:
-        return {}
-
-    city_state_zip = block_lines[zip_i]
-    m = CITY_ST_ZIP_RE.match(city_state_zip)
-    city = state = zipc = ""
-    if m:
-        city = clean_text(m.group(1))
-        state = m.group(2)
-        zipc = m.group(3)
-
-    # Street = nearest above ZIP line that looks like street
-    street = ""
-    street_i = None
-    for k in range(zip_i - 1, -1, -1):
-        if _looks_like_street(block_lines[k]):
-            street = block_lines[k]
-            street_i = k
+    for i, ln in enumerate(lines):
+        if ZIP5_RE.search(ln):
+            zip_i = i
             break
 
-    # Company = nearest meaningful line above street
+    # Company = first meaningful line before zip_i
     company = ""
-    if street_i is not None:
-        for k in range(street_i - 1, -1, -1):
-            cand = block_lines[k].strip()
-            if not cand:
-                continue
-            if _looks_like_city_state_zip(cand) or _looks_like_street(cand) or _looks_like_country_only(cand):
-                continue
-            # reject obvious location-only repeats
-            if zipc and zipc in cand:
-                continue
-            company = cand
+    company_i = None
+    search_upto = zip_i if zip_i is not None else len(lines)
+    for i in range(0, search_upto):
+        ln = lines[i].strip()
+        if not ln:
+            continue
+        if _looks_like_country_only(ln):
+            continue
+        if _looks_like_street(ln):
+            continue
+        if ZIP5_RE.search(ln):
+            continue
+        # avoid accidentally taking "Ship To" itself if it leaks
+        if ln.lower().startswith("ship"):
+            continue
+        company = ln
+        company_i = i
+        break
+
+    # Address = first street line after company (or from top if company missing)
+    address = ""
+    start_addr = (company_i + 1) if company_i is not None else 0
+    end_addr = zip_i if zip_i is not None else len(lines)
+    for i in range(start_addr, end_addr):
+        ln = lines[i].strip()
+        if _looks_like_street(ln):
+            address = ln
             break
 
-    # Fallback: in some PDFs company appears AFTER "Ship To" line but BEFORE street,
-    # and may be split across multiple lines. If company still empty, take the FIRST
-    # line in the block that isn't street/city/country.
-    if not company:
-        for cand in block_lines[: max(zip_i, 0)]:
-            c = cand.strip()
-            if not c:
-                continue
-            if _looks_like_city_state_zip(c) or _looks_like_street(c) or _looks_like_country_only(c):
-                continue
-            if zipc and zipc in c:
-                continue
-            company = c
-            break
+    # City/State/Zip from zip_i line
+    city = state = zipc = ""
+    if zip_i is not None:
+        parsed = _parse_city_state_zip(lines[zip_i])
+        city, state, zipc = parsed["City"], parsed["State"], parsed["ZipCode"]
 
-    # De-dup street if repeated twice
-    street_tokens = street.split()
-    if len(street_tokens) >= 4:
-        half = len(street_tokens) // 2
-        if street_tokens[:half] == street_tokens[half:]:
-            street = " ".join(street_tokens[:half])
-
-    # Final guardrails
-    if _looks_like_city_state_zip(company) or _looks_like_street(company) or _looks_like_country_only(company):
-        company = ""
+    # clean duplicates in address (common extraction glitch)
+    if address:
+        toks = address.split()
+        if len(toks) >= 4:
+            half = len(toks) // 2
+            if toks[:half] == toks[half:]:
+                address = " ".join(toks[:half])
 
     return {
         "Company": company,
-        "Address": street,
+        "Address": address,
         "City": city,
         "State": state,
         "ZipCode": zipc,
@@ -310,8 +340,7 @@ def extract_customer_number(words: List[dict], full_text: str) -> str:
         toks = row_tokens_norm(r["words"])
         if any(t.startswith("cust") or t.startswith("customer") for t in toks):
             cust_words = [
-                w
-                for w in r["words"]
+                w for w in r["words"]
                 if w["text_norm"].startswith("cust") or w["text_norm"].startswith("customer")
             ]
             if not cust_words:
@@ -356,34 +385,39 @@ def extract_created_by(words: List[dict], full_text: str) -> str:
 
 def extract_referral_manager(words: List[dict], full_text: str) -> str:
     """
-    FIX: Never guess from random ALLCAPS.
-    Only extract from explicit Salesperson/Sales Rep line.
-    Fallback: use DAYTON only if it appears AND we can't find a salesperson label.
+    IMPORTANT: No guessing.
+    Only use explicit labels for salesperson/sales rep; otherwise blank.
+
+    Acceptable labels (case-insensitive):
+      Salesperson
+      Sales Rep
+      Sales Rep.
+      Salesperson:
     """
     rows = group_rows(words, page=1, y_tol=3.0)
 
-    # Strong label-based: Salesperson / Sales Rep
+    label_re = re.compile(r"\b(sales\s*rep|salesperson)\b", re.IGNORECASE)
+
     for r in rows:
-        t = r["text"].lower()
-        if ("salesperson" in t) or ("sales rep" in t) or ("sales" in t and "person" in t) or ("sales" in t and "rep" in t):
-            # Prefer ALLCAPS token to the right; if not, take the last non-label word chunk
-            # 1) ALLCAPS token
-            for w in r["words"]:
-                txt = w["text"].strip()
-                if re.fullmatch(r"[A-Z]{3,}", txt) and txt.lower() not in {"cust", "customer"}:
-                    return txt
+        if not label_re.search(r["text"]):
+            continue
 
-            # 2) If not all caps, take last two words after the label
-            parts = [w["text"].strip() for w in r["words"] if w["text"].strip()]
-            # remove label-like words
-            parts_clean = [p for p in parts if p.lower() not in {"salesperson", "sales", "rep", "salesrep", "sales", "person"}]
-            if len(parts_clean) >= 1:
-                # last token might be the name
-                return parts_clean[-1]
+        # take text to the right of the label on the same row
+        # heuristic: last ALLCAPS token (like DAYTON) OR last word chunk after label
+        allcaps = []
+        for w in r["words"]:
+            txt = w["text"].strip()
+            if re.fullmatch(r"[A-Z]{3,}", txt) and txt.lower() not in {"cust", "customer"}:
+                allcaps.append(txt)
+        if allcaps:
+            return allcaps[-1]
 
-    # Controlled fallback: only if DAYTON exists anywhere
-    if re.search(r"\bDAYTON\b", full_text):
-        return "DAYTON"
+        # fallback: take last two "name-like" words after label
+        parts = [w["text"].strip() for w in r["words"] if w["text"].strip()]
+        # remove obvious label words
+        cleaned = [p for p in parts if p.lower() not in {"sales", "rep", "salesrep", "salesperson"}]
+        # return last token if any
+        return cleaned[-1] if cleaned else ""
 
     return ""
 
@@ -400,9 +434,7 @@ def parse_voelkr(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
     out["QuoteDate"] = extract_quote_date(full_text)
     out["TotalSales"] = extract_total_sales(full_text)
 
-    ship = extract_ship_to_block(words)
-    out.update(ship)
-
+    out.update(extract_ship_to_block(words))
     out["CustomerNumber"] = extract_customer_number(words, full_text)
     out["Created_By"] = extract_created_by(words, full_text)
     out["ReferralManager"] = extract_referral_manager(words, full_text)
