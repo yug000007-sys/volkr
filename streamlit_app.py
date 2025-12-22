@@ -129,7 +129,7 @@ def row_tokens_norm(row_words: List[dict]) -> List[str]:
 
 
 # =========================================================
-# FIELD EXTRACTORS (VOELKR)
+# VOELKR EXTRACTORS
 # =========================================================
 def extract_quote_number(full_text: str) -> str:
     m = QUOTE_NO_RE.search(full_text)
@@ -152,6 +152,7 @@ def extract_total_sales(full_text: str) -> str:
 def find_ship_to_anchor(rows: List[Dict[str, Any]]) -> Optional[dict]:
     for i, r in enumerate(rows):
         toks = row_tokens_norm(r["words"])
+        # token-based: works even if "Ship" and "To" are split
         if "ship" in toks and "to" in toks:
             ship_ws = [w for w in r["words"] if w["text_norm"] == "ship"]
             to_ws = [w for w in r["words"] if w["text_norm"] == "to"]
@@ -168,22 +169,30 @@ def _looks_like_city_state_zip(s: str) -> bool:
 
 def _looks_like_street(s: str) -> bool:
     s = clean_text(s)
-    # typical street starts with number
     return bool(re.match(r"^\d{2,6}\s+", s))
 
 
 def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
+    """
+    STRICT Ship To parsing (ALWAYS use Ship To):
+      - Find Ship+To token anchor
+      - Read next lines in same column window
+      - Identify city/state/zip line by ZIP
+      - Street = nearest line above ZIP that looks like a street
+      - Company = nearest non-street/non-city line above street
+    """
     rows = group_rows(words, page=1, y_tol=3.0)
     anchor = find_ship_to_anchor(rows)
     if not anchor:
         return {}
 
     start_i = anchor["row_idx"] + 1
-    col_left = max(0, anchor["x0"] - 40)
-    col_right = anchor["x1"] + 420
+    # widen window to avoid losing company line due to column spacing
+    col_left = max(0, anchor["x0"] - 80)
+    col_right = anchor["x1"] + 650
 
     block_lines: List[str] = []
-    for j in range(start_i, min(start_i + 14, len(rows))):
+    for j in range(start_i, min(start_i + 18, len(rows))):
         row_words = rows[j]["words"]
         in_col = [w for w in row_words if w["x0"] >= col_left and w["x1"] <= col_right]
         line = clean_text(" ".join(w["text"] for w in in_col))
@@ -196,7 +205,7 @@ def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
     if not block_lines:
         return {}
 
-    # city/state/zip line = first line containing ZIP
+    # city/state/zip = first line containing ZIP
     zip_i = None
     for k, ln in enumerate(block_lines):
         if ZIP_RE.search(ln):
@@ -213,43 +222,46 @@ def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
         state = m.group(2)
         zipc = m.group(3)
 
-    # street line = nearest line ABOVE city_state_zip that looks like street
+    # street = closest line above zip line that looks like street
     street = ""
+    street_i = None
     for k in range(zip_i - 1, -1, -1):
         if _looks_like_street(block_lines[k]):
             street = block_lines[k]
+            street_i = k
             break
 
-    # company line = nearest line ABOVE street that is NOT street and NOT city/state/zip
+    # company = closest meaningful line above street (NOT street, NOT city/state/zip)
     company = ""
-    if street:
-        street_i = block_lines.index(street)
+    if street_i is not None:
         for k in range(street_i - 1, -1, -1):
-            cand = block_lines[k]
+            cand = block_lines[k].strip()
             if not cand:
                 continue
             if _looks_like_city_state_zip(cand):
                 continue
             if _looks_like_street(cand):
                 continue
-            # reject if it contains only repeated city/state/zip fragments
+            if cand.upper() in {"USA", "UNITED STATES", "UNITED STATES OF AMERICA"}:
+                continue
             company = cand
             break
-    else:
-        # fallback: first line that is not city/state/zip
+
+    # fallback: first line before zip that isn't street/city
+    if not company and zip_i >= 1:
         for cand in block_lines[:zip_i]:
-            if cand and not _looks_like_city_state_zip(cand):
+            if cand and not _looks_like_city_state_zip(cand) and not _looks_like_street(cand):
                 company = cand
                 break
 
-    # clean duplication in street
+    # remove street duplication if any
     street_tokens = street.split()
     if len(street_tokens) >= 4:
         half = len(street_tokens) // 2
         if street_tokens[:half] == street_tokens[half:]:
             street = " ".join(street_tokens[:half])
 
-    # guardrails: company must not be city/state/zip or a street
+    # guardrails
     if _looks_like_city_state_zip(company) or _looks_like_street(company):
         company = ""
 
@@ -272,7 +284,10 @@ def extract_customer_number(words: List[dict], full_text: str) -> str:
     for i, r in enumerate(rows):
         toks = row_tokens_norm(r["words"])
         if any(t.startswith("cust") or t.startswith("customer") for t in toks):
-            cust_words = [w for w in r["words"] if w["text_norm"].startswith("cust") or w["text_norm"].startswith("customer")]
+            cust_words = [
+                w for w in r["words"]
+                if w["text_norm"].startswith("cust") or w["text_norm"].startswith("customer")
+            ]
             if not cust_words:
                 continue
             cw = cust_words[0]
@@ -294,7 +309,11 @@ def extract_customer_number(words: List[dict], full_text: str) -> str:
                     if re.fullmatch(r"\d{3,10}", d or ""):
                         return d
 
-    m = re.search(r"(?:cust|customer)\s*(?:#|no\.?|number)?\s*[:#\-]?\s*(\d{3,10})", full_text, re.IGNORECASE)
+    m = re.search(
+        r"(?:cust|customer)\s*(?:#|no\.?|number)?\s*[:#\-]?\s*(\d{3,10})",
+        full_text,
+        re.IGNORECASE
+    )
     return m.group(1) if m else ""
 
 
@@ -336,9 +355,7 @@ def parse_voelkr(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
     out["QuoteDate"] = extract_quote_date(full_text)
     out["TotalSales"] = extract_total_sales(full_text)
 
-    ship = extract_ship_to_block(words)
-    out.update(ship)
-
+    out.update(extract_ship_to_block(words))
     out["CustomerNumber"] = extract_customer_number(words, full_text)
     out["Created_By"] = extract_created_by(words, full_text)
     out["ReferralManager"] = extract_referral_manager(words, full_text)
