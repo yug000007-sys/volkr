@@ -1,520 +1,248 @@
-import io
+import os
 import re
-import zipfile
-from typing import List, Dict, Any, Optional
-from collections import defaultdict
-
+from datetime import datetime
+from pathlib import Path
+from ftplib import FTP
 import pdfplumber
-import pandas as pd
-import streamlit as st
+from openpyxl import Workbook, load_workbook
 
+# =========================
+# CONFIG
+# =========================
+PDF_FOLDER = r"./pdfs"                 # folder with your Voelker PDFs
+EXCEL_PATH = r"./voelker_output.xlsx"  # output excel
+SHEET_NAME = "Data"
 
-# =========================================================
-# SYSTEMS
-# =========================================================
-SYSTEM_TYPES = ["Cadre", "Voelkr"]  # Cadre stays blank for now
-VOELKR_DEFAULT_BRAND = "Voelker Controls"
-
-
-# =========================================================
-# OUTPUT HEADERS (EXACT)
-# =========================================================
-VOELKR_COLUMNS = [
-    "ReferralManager",
-    "ReferralEmail",
+# Your Excel headers (custom mapping)
+HEADERS = [
+    "PDFName",
+    "ReferralManager",   # <- Salesperson
     "QuoteNumber",
     "QuoteDate",
-    "Company",
-    "FirstName",
-    "LastName",
-    "ContactEmail",
-    "ContactPhone",
-    "Address",
-    "County",
+    "Company",           # <- ShipToName
+    "Address",           # <- ShipToStreet
     "City",
     "State",
-    "ZipCode",
-    "Country",
-    "manufacturer_Name",
-    "item_id",
-    "item_desc",
-    "Quantity",
-    "TotalSales",
-    "PDF",
-    "Brand",
-    "QuoteExpiration",
-    "CustomerNumber",
-    "UnitSales",
-    "Unit_Cost",
-    "sales_cost",
-    "cust_type",
-    "QuoteComment",
-    "Created_By",
-    "quote_line_no",
-    "DemoQuote",
+    "Zip",
+    "TotalSales",        # <- QuoteTotal
+    "Created_By",        # <- QuotedBy
+    "CustomerNumber"
 ]
 
+# FTP details (use env vars in real use)
+FTP_HOST = os.getenv("FTP_HOST", "ftp.yourserver.com")
+FTP_USER = os.getenv("FTP_USER", "username")
+FTP_PASS = os.getenv("FTP_PASS", "password")
+FTP_REMOTE_DIR = os.getenv("FTP_REMOTE_DIR", "/uploads/voelker")
 
-# =========================================================
-# REGEX
-# =========================================================
-QUOTE_NO_RE = re.compile(r"\b(\d{2}/\d{6})\b")
-DATE_RE = re.compile(r"\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b")
-ZIP5_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
-CITY_ST_ZIP_RE = re.compile(r"^(.*?)\s+([A-Z]{2})\s+(\d{5})(?:-\d{4})?$")
-MONEY_RE = re.compile(r"\b([\d,]+\.\d{2})\b")
+UPLOAD_EXCEL_TOO = True
 
 
-def clean_text(s: str) -> str:
-    return re.sub(r"\s{2,}", " ", (s or "").replace("\n", " ")).strip()
-
-
-def normalize_date(s: str) -> str:
-    s = (s or "").strip()
-    m = DATE_RE.search(s)
-    if not m:
-        return s
-    mm, dd, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    if yy < 100:
-        yy += 2000
-    return f"{mm:02d}/{dd:02d}/{yy:04d}"
-
-
-# =========================================================
-# PDF HELPERS
-# =========================================================
-def extract_full_text(pdf_bytes: bytes) -> str:
-    out = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+# =========================
+# PDF PARSING HELPERS
+# =========================
+def extract_text_from_pdf(pdf_path: str) -> str:
+    text_parts = []
+    with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            out.append(page.extract_text() or "")
-    return "\n".join(out)
+            t = page.extract_text() or ""
+            text_parts.append(t)
+    return "\n".join(text_parts)
 
+def find_first(pattern: str, text: str, flags=0) -> str:
+    m = re.search(pattern, text, flags)
+    return m.group(1).strip() if m else ""
 
-def extract_words(pdf_bytes: bytes) -> List[dict]:
-    words = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            ws = page.extract_words(x_tolerance=2, y_tolerance=2, use_text_flow=True) or []
-            for w in ws:
-                w["page"] = page.page_number
-                # normalized text for token matching
-                w["text_norm"] = (
-                    (w.get("text") or "")
-                    .strip()
-                    .lower()
-                    .replace(":", "")
-                    .replace("#", "")
-                )
-                words.append(w)
-    return words
+def parse_ship_to(text: str):
+    """
+    Attempts to extract Ship To name, street, city, state, zip
+    based on Voelker layout where 'Ship To' section repeats address lines.
+    """
+    # Strategy:
+    # Find the first block after "Ship To" that looks like:
+    # NAME \n STREET \n CITY STATE ZIP
+    # (Voelker sample repeats Sold To and Ship To; we just take the first good match.)
+    ship_block = ""
 
+    # Grab a slice starting at "Ship To" label if present
+    idx = text.find("Ship To")
+    slice_text = text[idx: idx + 800] if idx != -1 else text
 
-def group_rows(words: List[dict], page: int = 1, y_tol: float = 3.0) -> List[Dict[str, Any]]:
-    buckets = defaultdict(list)
-    for w in words:
-        if w.get("page") != page:
-            continue
-        key = round(w["top"] / y_tol) * y_tol
-        buckets[key].append(w)
-
-    rows = []
-    for y in sorted(buckets.keys()):
-        row_words = sorted(buckets[y], key=lambda x: x["x0"])
-        rows.append(
-            {
-                "y": y,
-                "words": row_words,
-                "text": clean_text(" ".join(w["text"] for w in row_words)),
-            }
-        )
-    return rows
-
-
-def row_tokens_norm(row_words: List[dict]) -> List[str]:
-    return [w["text_norm"] for w in row_words if w.get("text_norm")]
-
-
-# =========================================================
-# VOELKR EXTRACTORS
-# =========================================================
-def extract_quote_number(full_text: str) -> str:
-    m = QUOTE_NO_RE.search(full_text)
-    return m.group(1) if m else ""
-
-
-def extract_quote_date(full_text: str) -> str:
-    m = DATE_RE.search(full_text)
-    return normalize_date(m.group(0)) if m else ""
-
-
-def extract_total_sales(full_text: str) -> str:
-    m = re.search(
-        r"(?:Total\s*Sales|Grand\s*Total|Total)\s*[: ]+\$?\s*([\d,]+\.\d{2})",
-        full_text,
-        re.IGNORECASE,
+    # Match address block:
+    # line1: company
+    # line2: street
+    # line3: city state zip
+    addr_match = re.search(
+        r"Ship To\s*\n([A-Z0-9 &\.\-/,]+)\n([A-Z0-9 \.\-/,#]+)\n([A-Z \.\-']+)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)",
+        slice_text,
+        re.MULTILINE
     )
-    if m:
-        return m.group(1)
-    monies = MONEY_RE.findall(full_text)
-    return monies[-1] if monies else ""
 
+    if addr_match:
+        name = addr_match.group(1).strip()
+        street = addr_match.group(2).strip()
+        city = addr_match.group(3).strip()
+        state = addr_match.group(4).strip()
+        zipc = addr_match.group(5).strip()
+        return name, street, city, state, zipc
 
-def find_ship_to_anchor(rows: List[Dict[str, Any]]) -> Optional[dict]:
-    """
-    Match 'Ship To' even if split into separate tokens or has punctuation.
-    """
-    for i, r in enumerate(rows):
-        toks = row_tokens_norm(r["words"])
-        if "ship" in toks and "to" in toks:
-            ship_ws = [w for w in r["words"] if w["text_norm"] == "ship"]
-            to_ws = [w for w in r["words"] if w["text_norm"] == "to"]
-            if ship_ws and to_ws:
-                x0 = min(w["x0"] for w in ship_ws)
-                x1 = max(w["x1"] for w in to_ws)
-                return {"row_idx": i, "x0": x0, "x1": x1}
-    return None
+    # Fallback: sometimes "Ship To" not captured in slice; try anywhere
+    addr_match2 = re.search(
+        r"\n([A-Z0-9 &\.\-/,]+)\n([A-Z0-9 \.\-/,#]+)\n([A-Z \.\-']+)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\n",
+        text,
+        re.MULTILINE
+    )
+    if addr_match2:
+        return (
+            addr_match2.group(1).strip(),
+            addr_match2.group(2).strip(),
+            addr_match2.group(3).strip(),
+            addr_match2.group(4).strip(),
+            addr_match2.group(5).strip(),
+        )
 
+    return "", "", "", "", ""
 
-def _looks_like_street(s: str) -> bool:
-    s = clean_text(s)
-    return bool(re.match(r"^\d{2,6}\s+", s))
+def parse_voelker_fields(text: str) -> dict:
+    # These patterns rely on the header row style in your samples.
+    quote_date = find_first(r"\n(\d{1,2}/\d{1,2}/\d{2})\s+\d{1,2}/\d{1,2}/\d{2}\s+", text)
+    # Quote # looks like 01/125785
+    quote_number = find_first(r"\n(0\d/\d{6})\s", text)
+    quoted_by = find_first(r"\n(0\d/\d{6})\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\s+UPS", text)
+    if not quoted_by:
+        # fallback: try find after Quote # line
+        quoted_by = find_first(r"\n0\d/\d{6}\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\s+", text)
 
+    # Salesperson and Cust # appear on same header line in sample:
+    # 9/24/25 12/31/25 JULIA CAO DAYTON 10980 NET 30 DAYS
+    salesperson = ""
+    cust_no = ""
+    header_line = find_first(r"\n\d{1,2}/\d{1,2}/\d{2}\s+\d{1,2}/\d{1,2}/\d{2}\s+.+\n", text)
+    if header_line:
+        # Split line and infer last numeric token before Terms
+        tokens = header_line.strip().split()
+        # heuristic: cust # is first all-digit token of length>=4
+        for i, tok in enumerate(tokens):
+            if tok.isdigit() and len(tok) >= 4:
+                cust_no = tok
+                # salesperson is token immediately before cust (in your sample it's "DAYTON")
+                if i - 1 >= 0:
+                    salesperson = tokens[i - 1]
+                break
 
-def _looks_like_country_only(s: str) -> bool:
-    s = clean_text(s).upper()
-    return s in {"USA", "UNITED STATES", "UNITED STATES OF AMERICA"}
+    # Quote Total near bottom: "Quote Total" then amount line
+    # Sample: Quote Total 23,540.00
+    quote_total = find_first(r"Quote Total\s*\n?\s*([\d,]+\.\d{2})", text)
 
-
-def _parse_city_state_zip(line: str) -> Dict[str, str]:
-    """
-    Handles:
-      'TRENTON OH 45067-9760'
-      'TIPP CITY OH 45371'
-    """
-    line = clean_text(line)
-    # normalize "City, ST ZIP" -> "City ST ZIP"
-    line = line.replace(",", " ")
-    line = re.sub(r"\s{2,}", " ", line).strip()
-
-    # Find ZIP (5 or 9)
-    mzip = re.search(r"\b(\d{5})(?:-(\d{4}))?\b", line)
-    if not mzip:
-        return {"City": "", "State": "", "ZipCode": ""}
-
-    zip5 = mzip.group(1)
-    # take the token just before zip as state, and everything before that as city
-    before = line[: mzip.start()].strip()
-    parts = before.split()
-    if len(parts) < 2:
-        return {"City": before, "State": "", "ZipCode": zip5}
-
-    state = parts[-1]
-    city = " ".join(parts[:-1]).strip()
-
-    # guard: state should be 2 letters
-    if not re.fullmatch(r"[A-Z]{2}", state.upper()):
-        # fallback to regex City ST ZIP
-        m = CITY_ST_ZIP_RE.match(re.sub(r"\b(\d{5})(?:-\d{4})?\b", zip5, line))
-        if m:
-            return {"City": clean_text(m.group(1)), "State": m.group(2), "ZipCode": zip5}
-        return {"City": before, "State": "", "ZipCode": zip5}
-
-    return {"City": clean_text(city), "State": state.upper(), "ZipCode": zip5}
-
-
-def extract_ship_to_block(words: List[dict]) -> Dict[str, str]:
-    """
-    Required behavior:
-      Company/Address/City/State/Zip MUST come from Ship To.
-
-    Robust rules based on your sample:
-      Ship To:
-        TRENTON BREWERY
-        2525 WAYNE MADISON ROAD
-        TRENTON OH 45067-9760
-
-    Implementation:
-      1) find Ship To anchor row
-      2) take next non-empty lines in the Ship To column window
-      3) Company = first meaningful line (not street, not city/state/zip, not country)
-      4) Address = first street-like line after company
-      5) City/State/Zip = first line containing ZIP after address/company
-    """
-    rows = group_rows(words, page=1, y_tol=3.0)
-    anchor = find_ship_to_anchor(rows)
-    if not anchor:
-        return {}
-
-    start_i = anchor["row_idx"] + 1
-    col_left = max(0, anchor["x0"] - 160)
-    col_right = anchor["x1"] + 900
-
-    # collect candidate lines under Ship To
-    lines: List[str] = []
-    for j in range(start_i, min(start_i + 30, len(rows))):
-        row_words = rows[j]["words"]
-        in_col = [w for w in row_words if w["x0"] >= col_left and w["x1"] <= col_right]
-        line = clean_text(" ".join(w["text"] for w in in_col))
-        if not line:
-            continue
-
-        # stop when leaving ship-to block
-        if re.search(r"\b(bill\s*to|sold\s*to|subtotal|grand\s*total|total\b|items?|product)\b", line, re.IGNORECASE):
-            break
-
-        lines.append(line)
-
-    if not lines:
-        return {}
-
-    # identify city/state/zip line index = first line with ZIP
-    zip_i = None
-    for i, ln in enumerate(lines):
-        if ZIP5_RE.search(ln):
-            zip_i = i
-            break
-
-    # Company = first meaningful line before zip_i
-    company = ""
-    company_i = None
-    search_upto = zip_i if zip_i is not None else len(lines)
-    for i in range(0, search_upto):
-        ln = lines[i].strip()
-        if not ln:
-            continue
-        if _looks_like_country_only(ln):
-            continue
-        if _looks_like_street(ln):
-            continue
-        if ZIP5_RE.search(ln):
-            continue
-        # avoid accidentally taking "Ship To" itself if it leaks
-        if ln.lower().startswith("ship"):
-            continue
-        company = ln
-        company_i = i
-        break
-
-    # Address = first street line after company (or from top if company missing)
-    address = ""
-    start_addr = (company_i + 1) if company_i is not None else 0
-    end_addr = zip_i if zip_i is not None else len(lines)
-    for i in range(start_addr, end_addr):
-        ln = lines[i].strip()
-        if _looks_like_street(ln):
-            address = ln
-            break
-
-    # City/State/Zip from zip_i line
-    city = state = zipc = ""
-    if zip_i is not None:
-        parsed = _parse_city_state_zip(lines[zip_i])
-        city, state, zipc = parsed["City"], parsed["State"], parsed["ZipCode"]
-
-    # clean duplicates in address (common extraction glitch)
-    if address:
-        toks = address.split()
-        if len(toks) >= 4:
-            half = len(toks) // 2
-            if toks[:half] == toks[half:]:
-                address = " ".join(toks[:half])
+    ship_name, ship_street, ship_city, ship_state, ship_zip = parse_ship_to(text)
 
     return {
-        "Company": company,
-        "Address": address,
-        "City": city,
-        "State": state,
-        "ZipCode": zipc,
-        "Country": "USA",
+        "ReferralManager": salesperson,
+        "CustomerNumber": cust_no,
+        "QuoteDate": quote_date,
+        "QuoteNumber": quote_number,
+        "Created_By": quoted_by,
+        "Company": ship_name,
+        "Address": ship_street,
+        "City": ship_city,
+        "State": ship_state,
+        "Zip": ship_zip,
+        "TotalSales": quote_total.replace(",", "") if quote_total else ""
     }
 
 
-def extract_customer_number(words: List[dict], full_text: str) -> str:
-    rows = group_rows(words, page=1, y_tol=3.0)
-
-    def digits_only(s: str) -> str:
-        return re.sub(r"\D", "", s or "")
-
-    for i, r in enumerate(rows):
-        toks = row_tokens_norm(r["words"])
-        if any(t.startswith("cust") or t.startswith("customer") for t in toks):
-            cust_words = [
-                w for w in r["words"]
-                if w["text_norm"].startswith("cust") or w["text_norm"].startswith("customer")
-            ]
-            if not cust_words:
-                continue
-            cw = cust_words[0]
-            x_anchor = cw["x0"]
-
-            right = [w for w in r["words"] if w["x0"] > x_anchor]
-            for w in right:
-                d = digits_only(w["text"])
-                if re.fullmatch(r"\d{3,10}", d or ""):
-                    return d
-
-            for down in range(1, 4):
-                if i + down >= len(rows):
-                    break
-                r2 = rows[i + down]["words"]
-                near = [w for w in r2 if w["x0"] >= x_anchor - 10]
-                for w in near:
-                    d = digits_only(w["text"])
-                    if re.fullmatch(r"\d{3,10}", d or ""):
-                        return d
-
-    m = re.search(
-        r"(?:cust|customer)\s*(?:#|no\.?|number)?\s*[:#\-]?\s*(\d{3,10})",
-        full_text,
-        re.IGNORECASE,
-    )
-    return m.group(1) if m else ""
-
-
-def extract_created_by(words: List[dict], full_text: str) -> str:
-    m = re.search(
-        r"(Created\s*By|Prepared\s*By|Entered\s*By)\s*[:#]?\s*([A-Z][A-Za-z.'-]+\s+[A-Z][A-Za-z.'-]+)",
-        full_text,
-        re.IGNORECASE,
-    )
-    if m:
-        return clean_text(m.group(2))
-    return ""
-
-
-def extract_referral_manager(words: List[dict], full_text: str) -> str:
-    """
-    IMPORTANT: No guessing.
-    Only use explicit labels for salesperson/sales rep; otherwise blank.
-
-    Acceptable labels (case-insensitive):
-      Salesperson
-      Sales Rep
-      Sales Rep.
-      Salesperson:
-    """
-    rows = group_rows(words, page=1, y_tol=3.0)
-
-    label_re = re.compile(r"\b(sales\s*rep|salesperson)\b", re.IGNORECASE)
-
-    for r in rows:
-        if not label_re.search(r["text"]):
-            continue
-
-        # take text to the right of the label on the same row
-        # heuristic: last ALLCAPS token (like DAYTON) OR last word chunk after label
-        allcaps = []
-        for w in r["words"]:
-            txt = w["text"].strip()
-            if re.fullmatch(r"[A-Z]{3,}", txt) and txt.lower() not in {"cust", "customer"}:
-                allcaps.append(txt)
-        if allcaps:
-            return allcaps[-1]
-
-        # fallback: take last two "name-like" words after label
-        parts = [w["text"].strip() for w in r["words"] if w["text"].strip()]
-        # remove obvious label words
-        cleaned = [p for p in parts if p.lower() not in {"sales", "rep", "salesrep", "salesperson"}]
-        # return last token if any
-        return cleaned[-1] if cleaned else ""
-
-    return ""
-
-
-def parse_voelkr(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
-    full_text = extract_full_text(pdf_bytes)
-    words = extract_words(pdf_bytes)
-
-    out = {c: "" for c in VOELKR_COLUMNS}
-    out["PDF"] = filename
-    out["Brand"] = VOELKR_DEFAULT_BRAND
-
-    out["QuoteNumber"] = extract_quote_number(full_text)
-    out["QuoteDate"] = extract_quote_date(full_text)
-    out["TotalSales"] = extract_total_sales(full_text)
-
-    out.update(extract_ship_to_block(words))
-    out["CustomerNumber"] = extract_customer_number(words, full_text)
-    out["Created_By"] = extract_created_by(words, full_text)
-    out["ReferralManager"] = extract_referral_manager(words, full_text)
-
-    return out
-
-
-# =========================================================
-# STREAMLIT APP
-# =========================================================
-st.set_page_config(page_title="PDF Extractor", layout="wide")
-st.title("PDF Extractor")
-
-if "uploader_key" not in st.session_state:
-    st.session_state["uploader_key"] = 0
-if "result_zip" not in st.session_state:
-    st.session_state["result_zip"] = None
-if "result_df" not in st.session_state:
-    st.session_state["result_df"] = None
-if "result_summary" not in st.session_state:
-    st.session_state["result_summary"] = None
-
-system_type = st.selectbox("System type", SYSTEM_TYPES, index=1)
-
-uploaded_files = st.file_uploader(
-    "Upload PDF(s)",
-    type=["pdf"],
-    accept_multiple_files=True,
-    key=f"pdf_uploader_{st.session_state['uploader_key']}",
-)
-
-extract_btn = st.button("Extract")
-
-if st.session_state["result_zip"] is not None:
-    st.success(st.session_state["result_summary"] or "Done.")
-    st.dataframe(st.session_state["result_df"].head(50), use_container_width=True)
-
-    st.download_button(
-        "Download ZIP (CSV + PDFs)",
-        data=st.session_state["result_zip"],
-        file_name=f"{system_type.lower()}_output.zip",
-        mime="application/zip",
-    )
-
-    if st.button("New extraction"):
-        st.session_state["result_zip"] = None
-        st.session_state["result_df"] = None
-        st.session_state["result_summary"] = None
-        st.session_state["uploader_key"] += 1
-        st.rerun()
-
-if extract_btn:
-    if system_type == "Cadre":
-        st.info("Cadre mapping is not configured yet. Select **Voelkr**.")
+# =========================
+# EXCEL HELPERS
+# =========================
+def ensure_workbook(path: str):
+    if os.path.exists(path):
+        wb = load_workbook(path)
+        ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.create_sheet(SHEET_NAME)
     else:
-        if not uploaded_files:
-            st.error("Please upload at least one PDF.")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = SHEET_NAME
+        ws.append(HEADERS)
+    # ensure headers present if empty
+    if ws.max_row == 1 and ws.max_column == 1 and ws["A1"].value is None:
+        ws.append(HEADERS)
+    # ensure first row is headers
+    if [c.value for c in ws[1]] != HEADERS:
+        # If file exists but headers differ, don't overwrite silently
+        raise ValueError(f"Excel headers mismatch. Expected {HEADERS}, found {[c.value for c in ws[1]]}")
+    return wb, ws
+
+def append_row(ws, row_dict: dict, pdf_name: str):
+    row = []
+    for h in HEADERS:
+        if h == "PDFName":
+            row.append(pdf_name)
         else:
-            file_data = [{"name": f.name, "bytes": f.read()} for f in uploaded_files]
+            row.append(row_dict.get(h, ""))
+    ws.append(row)
 
-            rows_out: List[Dict[str, Any]] = []
-            progress = st.progress(0.0)
-            status = st.empty()
 
-            for idx, fd in enumerate(file_data, start=1):
-                status.text(f"Processing {idx}/{len(file_data)}: {fd['name']}")
-                rows_out.append(parse_voelkr(fd["bytes"], fd["name"]))
-                progress.progress(idx / len(file_data))
+# =========================
+# FTP UPLOAD
+# =========================
+def ftp_upload_files(file_paths, remote_dir, also_upload_excel=None):
+    with FTP(FTP_HOST) as ftp:
+        ftp.login(FTP_USER, FTP_PASS)
+        # try change/create dir
+        try:
+            ftp.cwd(remote_dir)
+        except Exception:
+            # create nested dirs
+            parts = [p for p in remote_dir.split("/") if p]
+            cur = ""
+            for p in parts:
+                cur += f"/{p}"
+                try:
+                    ftp.cwd(cur)
+                except Exception:
+                    ftp.mkd(cur)
+                    ftp.cwd(cur)
 
-            df = pd.DataFrame(rows_out, columns=VOELKR_COLUMNS)
+        for fp in file_paths:
+            fn = os.path.basename(fp)
+            with open(fp, "rb") as f:
+                ftp.storbinary(f"STOR {fn}", f)
 
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("extracted/voelkr_extracted.csv", df.to_csv(index=False).encode("utf-8"))
-                for fd in file_data:
-                    zf.writestr(f"pdfs/{fd['name']}", fd["bytes"])
-            zip_buf.seek(0)
+        if also_upload_excel and os.path.exists(also_upload_excel):
+            fn = os.path.basename(also_upload_excel)
+            with open(also_upload_excel, "rb") as f:
+                ftp.storbinary(f"STOR {fn}", f)
 
-            st.session_state["result_zip"] = zip_buf.getvalue()
-            st.session_state["result_df"] = df
-            st.session_state["result_summary"] = f"Parsed {len(file_data)} PDF(s). Output rows: {len(df)}."
-            st.session_state["uploader_key"] += 1
-            st.rerun()
+
+def main():
+    pdf_dir = Path(PDF_FOLDER)
+    pdf_files = sorted([str(p) for p in pdf_dir.glob("*.pdf")])
+
+    if not pdf_files:
+        print(f"No PDFs found in {PDF_FOLDER}")
+        return
+
+    wb, ws = ensure_workbook(EXCEL_PATH)
+
+    for pdf_path in pdf_files:
+        pdf_name = os.path.basename(pdf_path)
+        text = extract_text_from_pdf(pdf_path)
+        data = parse_voelker_fields(text)
+        append_row(ws, data, pdf_name)
+        print(f"Parsed: {pdf_name} -> QuoteNumber={data.get('QuoteNumber')} TotalSales={data.get('TotalSales')}")
+
+    wb.save(EXCEL_PATH)
+    print(f"Saved Excel: {EXCEL_PATH}")
+
+    # Upload PDFs (and optionally Excel) to FTP
+    ftp_upload_files(
+        pdf_files,
+        FTP_REMOTE_DIR,
+        also_upload_excel=EXCEL_PATH if UPLOAD_EXCEL_TOO else None
+    )
+    print(f"Uploaded {len(pdf_files)} PDFs to FTP: {FTP_REMOTE_DIR}")
+    if UPLOAD_EXCEL_TOO:
+        print("Uploaded Excel too.")
+
+if __name__ == "__main__":
+    main()
