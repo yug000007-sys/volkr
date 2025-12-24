@@ -1,114 +1,195 @@
-import streamlit as st
-import pdfplumber
-import pandas as pd
 import re
-from io import BytesIO
+import csv
+from pathlib import Path
 
-# -----------------------------
-# PAGE SETUP (prevents blank page)
-# -----------------------------
-st.set_page_config(page_title="Voelker PDF to Excel", layout="wide")
-st.title("Voelker PDF → Excel Automation")
-st.caption("Upload Voelker quote PDFs and download structured Excel output")
+import pdfplumber
 
-# -----------------------------
-# HELPERS
-# -----------------------------
-def extract_text(pdf_file):
-    text = ""
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text() or ""
-    return text
 
-def find(pattern, text):
-    m = re.search(pattern, text, re.MULTILINE)
-    return m.group(1).strip() if m else ""
+# ---------- helpers ----------
+def clean(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", (s or "").strip())
 
-def parse_pdf(text):
-    data = {}
+def find_labeled_value(text: str, label: str) -> str:
+    """
+    Looks for patterns like:
+      Label: value
+      Label value
+    Captures up to end of line.
+    """
+    # Try "Label: value"
+    m = re.search(rf"(?im)^\s*{re.escape(label)}\s*:\s*(.+?)\s*$", text)
+    if m:
+        return clean(m.group(1))
 
-    data["ReferralManager"] = find(r"\d{2}/\d{2}/\d{2}\s+\d{2}/\d{2}/\d{2}.*\s([A-Z]+)\s+\d+", text)
-    data["CustomerNumber"] = find(r"\s(\d{4,})\s+NET", text)
-    data["QuoteDate"] = find(r"(\d{1,2}/\d{1,2}/\d{2})\s+\d{1,2}/\d{1,2}/\d{2}", text)
-    data["QuoteNumber"] = find(r"(0\d/\d{6})", text)
-    data["Created_By"] = find(r"(0\d/\d{6})\s+([A-Za-z ]+)\s+UPS", text)
-    data["TotalSales"] = find(r"Quote Total\s+([\d,]+\.\d{2})", text).replace(",", "")
+    # Try "Label   value" (2+ spaces between)
+    m = re.search(rf"(?im)^\s*{re.escape(label)}\s{{2,}}(.+?)\s*$", text)
+    if m:
+        return clean(m.group(1))
 
-    # Ship To parsing
-    ship = re.search(
-        r"Ship To\s*\n([A-Z0-9 &]+)\n([A-Z0-9 .]+)\n([A-Z ]+)\s+([A-Z]{2})\s+(\d{5})",
-        text,
-        re.MULTILINE
+    return ""
+
+def extract_ship_to(text: str):
+    """
+    CRITICAL: Always extract address fields from the “Ship To” section.
+    Assumes Ship To block like:
+
+      Ship To:
+      COMPANY NAME
+      123 MAIN ST
+      SUITE 400   (optional)
+      CITY, ST 12345
+
+    Returns: (company, street_address, city, state, zip)
+    """
+    # Grab lines and locate the Ship To header line
+    lines = [clean(l) for l in text.splitlines()]
+    ship_idx = None
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"(?i)ship\s*to\s*:?", line):
+            ship_idx = i
+            break
+
+    if ship_idx is None:
+        return ("", "", "", "", "")
+
+    # Collect following non-empty lines until a stopping condition
+    # Stop if we hit common next-section headers (adjustable)
+    stop_headers = re.compile(
+        r"(?i)^(bill\s*to|sold\s*to|remit\s*to|terms|notes|ship\s*via|quote|customer|cust\s*#|salesperson|quoted\s*by)\b"
     )
 
-    if ship:
-        data["Company"] = ship.group(1)
-        data["Address"] = ship.group(2)
-        data["City"] = ship.group(3)
-        data["State"] = ship.group(4)
-        data["Zip"] = ship.group(5)
+    block = []
+    for j in range(ship_idx + 1, len(lines)):
+        if not lines[j]:
+            # allow a single blank inside, but break on multiple blanks after some content
+            if block:
+                # peek ahead: if next non-empty is a header, stop
+                continue
+            else:
+                continue
+        if stop_headers.match(lines[j]) and block:
+            break
+        # Also stop if we hit another label style line like "X: Y" after collecting something
+        if block and re.match(r"(?i)^[A-Za-z][A-Za-z \/#&\.-]{2,}:\s*\S+", lines[j]):
+            break
+        block.append(lines[j])
+        # safety: don't let it run too far
+        if len(block) >= 8:
+            break
+
+    if not block:
+        return ("", "", "", "", "")
+
+    company = block[0] if len(block) >= 1 else ""
+
+    # Find the city/state/zip line (usually last)
+    city = state = zip_code = ""
+    city_state_zip_idx = None
+
+    # Try from bottom up to find "City, ST 12345" OR "City ST 12345"
+    for k in range(len(block) - 1, -1, -1):
+        m = re.match(r"^(?P<city>.+?)[,\s]+(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-\d{4})?)$", block[k])
+        if m:
+            city = clean(m.group("city").rstrip(","))
+            state = m.group("state")
+            zip_code = m.group("zip")
+            city_state_zip_idx = k
+            break
+
+    # Street address = lines between company and city/state/zip line
+    street_lines = []
+    if city_state_zip_idx is not None:
+        street_lines = block[1:city_state_zip_idx]
     else:
-        data["Company"] = ""
-        data["Address"] = ""
-        data["City"] = ""
-        data["State"] = ""
-        data["Zip"] = ""
+        # fallback: treat remaining lines as street
+        street_lines = block[1:]
 
-    return data
+    street_address = clean(", ".join([l for l in street_lines if l]))
 
-# -----------------------------
-# UI
-# -----------------------------
-uploaded_files = st.file_uploader(
-    "Upload Voelker PDF files",
-    type=["pdf"],
-    accept_multiple_files=True
-)
+    return (company, street_address, city, state, zip_code)
 
-if uploaded_files:
-    st.success(f"{len(uploaded_files)} PDF(s) uploaded")
+def extract_pdf_text(pdf_path: Path) -> str:
+    # Most Voelkr PDFs are text-based; if some are scanned images, this won’t work without OCR.
+    parts = []
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if t.strip():
+                parts.append(t)
+    return "\n".join(parts)
 
-    if st.button("Generate Excel"):
-        rows = []
 
-        for pdf in uploaded_files:
-            text = extract_text(pdf)
-            parsed = parse_pdf(text)
+# ---------- main extraction ----------
+def extract_fields_from_pdf(pdf_path: Path) -> dict:
+    text = extract_pdf_text(pdf_path)
 
-            row = {
-                "PDFName": pdf.name,
-                "ReferralManager": parsed.get("ReferralManager", ""),
-                "QuoteNumber": parsed.get("QuoteNumber", ""),
-                "QuoteDate": parsed.get("QuoteDate", ""),
-                "Company": parsed.get("Company", ""),
-                "Address": parsed.get("Address", ""),
-                "City": parsed.get("City", ""),
-                "State": parsed.get("State", ""),
-                "Zip": parsed.get("Zip", ""),
-                "TotalSales": parsed.get("TotalSales", ""),
-                "Created_By": parsed.get("Created_By", ""),
-                "CustomerNumber": parsed.get("CustomerNumber", "")
-            }
+    company, ship_addr, city, state, zip_code = extract_ship_to(text)
 
-            rows.append(row)
+    # Label-based fields (tweak labels if your PDFs use different wording)
+    salesperson = find_labeled_value(text, "Salesperson")
+    quoted_by = find_labeled_value(text, "Quoted By")
 
-        df = pd.DataFrame(rows)
+    # Customer number label variants
+    cust_num = (
+        find_labeled_value(text, "Cust #")
+        or find_labeled_value(text, "Cust#")
+        or find_labeled_value(text, "Customer #")
+        or find_labeled_value(text, "Customer#")
+    )
 
-        st.subheader("Preview")
-        st.dataframe(df, use_container_width=True)
+    return {
+        "File": pdf_path.name,
+        "Company": company,
+        "Ship To Address": ship_addr,
+        "City": city,
+        "State": state,
+        "Zip": zip_code,
+        "Salesperson": salesperson,
+        "Quoted By": quoted_by,
+        "Cust #": cust_num,
+    }
 
-        # Excel download
-        buffer = BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="VoelkerQuotes")
+def run_batch(input_folder: str, output_csv: str):
+    input_path = Path(input_folder)
+    pdfs = sorted(input_path.glob("*.pdf"))
 
-        st.download_button(
-            label="Download Excel",
-            data=buffer.getvalue(),
-            file_name="voelker_quotes.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    rows = []
+    for pdf in pdfs:
+        try:
+            rows.append(extract_fields_from_pdf(pdf))
+        except Exception as e:
+            rows.append({
+                "File": pdf.name,
+                "Company": "",
+                "Ship To Address": "",
+                "City": "",
+                "State": "",
+                "Zip": "",
+                "Salesperson": "",
+                "Quoted By": "",
+                "Cust #": "",
+                "Error": str(e),
+            })
 
-else:
-    st.info("Upload PDF files to begin.")
+    fieldnames = [
+        "File", "Company", "Ship To Address", "City", "State", "Zip",
+        "Salesperson", "Quoted By", "Cust #", "Error"
+    ]
+    # Ensure all keys exist
+    for r in rows:
+        for f in fieldnames:
+            r.setdefault(f, "")
+
+    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Wrote {len(rows)} rows to {output_csv}")
+
+
+if __name__ == "__main__":
+    # Example usage:
+    #   put PDFs in ./voelkr_pdfs
+    #   python extract_voelkr.py
+    run_batch("./voelkr_pdfs", "voelkr_extracted.csv")
